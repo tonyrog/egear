@@ -261,6 +261,8 @@ handle_event({struct,[{"l", Layout}]}, State) ->
     {L,C} = decode_layout(Layout,[]),
     io:format("Layout = ~p\n", [L]),
     io:format("config = ~p\n", [C]),
+    Ls = format_layout(L),
+    io:format("Layout pos = ~p\n", [Ls]),
     State#state { layout = L, config = C };
 handle_event(_Event, State) ->
     State.
@@ -309,7 +311,6 @@ handle_inp(Input, State) when State#state.config =/= undefined ->
 handle_inp(_Input, State) ->
     State.
 
-
 decode_layout({struct,[{"u",Unique},
 		       {"i",Index},
 		       {"t",Type},
@@ -327,3 +328,74 @@ decode_layout_([A | As], Acc, Conf) ->
     decode_layout_(As, [L|Acc], Conf1);
 decode_layout_([], Acc, Conf) ->
     {lists:reverse(Acc), Conf}.
+
+%% format layout put the components on the grid.
+%% return a list [{X,Y,Type,Index}]
+multiply({A11,A12,A21,A22},{B11,B12,B21,B22}) ->
+    { A11*B11 + A12*B21, A11*B12 + A12*B22,
+      A21*B11 + A22*B21, A21*B12 + A22*B22 }.
+
+rotate_90(A) -> multiply(A,{0,-1,1,0}).    %% left,ccw
+rotate_270(A)  -> multiply(A,{0,1,-1,0}).  %% right,cw
+rotate_180(A) -> multiply(A,{-1,0,0,-1}).  %% half turn
+move({A11,A12,A21,A22},{Dx,Dy},{X,Y}) -> {Dx*A11+Dy*A12+X,Dx*A21+Dy*A22+Y}.
+-define(ID, {1,0,0,1}).
+
+format_layout(L) ->
+    lists:sort(format_item(L, {0,0}, ?ID, [])).
+
+format_item(null, _Pos, _Mx, Acc) ->
+    Acc;
+format_item(#layout{t=T,i=I,c=Items}, Pos={X,Y}, Mx, Acc) ->
+    format_layout(T,Items,Pos,Mx,[{Y,X,T,I} | Acc]).
+    
+format_layout(Type, [R,D,L], Pos, Mx, Acc) when
+      Type =:= ?TYPE_SCREEN; Type =:= ?TYPE_BUTTON; Type =:= ?TYPE_DIAL ->
+    Acc1 = format_item(R, move(Mx,{1,0},Pos), rotate_270(Mx), Acc),
+    Acc2 = format_item(D, move(Mx,{0,1},Pos), Mx, Acc1),
+    Acc3 = format_item(L, move(Mx,{-1,0},Pos),rotate_90(Mx), Acc2),
+    Acc3;
+format_layout(Type,[UR,R,DR,DL,L],Pos,Mx,Acc=[{_,_,T,I}|_]) when
+      Type =:= ?TYPE_SLIDER ->
+    {X1,Y1} = move(Mx,{1,0},Pos),
+    Acc0 = [{Y1,X1,T,I}|Acc],
+    Acc1 = format_item(UR, move(Mx,{1,-1},Pos), rotate_180(Mx), Acc0),
+    Acc2 = format_item(R,  move(Mx,{2,0},Pos), rotate_270(Mx), Acc1),
+    Acc3 = format_item(DR, move(Mx,{1,1},Pos), Mx,Acc2),
+    Acc4 = format_item(DL, move(Mx,{0,1},Pos), Mx, Acc3),
+    Acc5 = format_item(L, move(Mx,{-1,0},Pos), rotate_90(Mx), Acc4),
+    Acc5.
+
+
+%% SCREEN
+%% +-------+
+%% |       |
+%% |  Gear |
+%% |       |
+%% +-------+
+%% +-------+
+%% |  ---  |
+%% | |   | |
+%% |  ---  |
+%% +-------+
+%% +-------+
+%% |  ===  |
+%% | |XXX| |
+%% |  ===  |
+%% +-------+
+%% +-------+
+%% |   |   |
+%% |   |   |
+%% |  ===  |
+%% |   |   |
+%% |   |   |
+%% |   |   |
+%% +-------+
+%% +---------------+
+%% |               |
+%% | ---||-------  |
+%% |               |
+%% +---------------+
+%%
+render_layout(Pos) ->
+    ok.
