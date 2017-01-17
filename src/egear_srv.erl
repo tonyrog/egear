@@ -49,6 +49,13 @@
 	  t :: integer(), %% type TYPE_x
 	  c :: [null|#layout{}]  %% config
 	}).
+
+-record(index,
+	{
+	  i :: integer(),
+	  t :: integer(),
+	  u :: string()
+	}).
 %%
 %% Relative screen_orientaion = 2!
 %% SCREEN array [Right,Down,Left]
@@ -56,13 +63,15 @@
 %% DIAL array [Right,Down,Left]
 %% SLIDER array = [UpRight,Right,DownRight,DownLeft,Left]
 %%
+-type rgb() :: {byte(),byte(),byte()}.
 
 -record(state, 
 	{
 	  device :: string(),
 	  uart   :: port(),
 	  layout :: #layout{},
-	  config :: {Index::integer,Type::integer,Unique::string()}
+	  index_list :: [#index{}],
+	  config :: [{Unique::string(),color,rgb()}]
 	}).
 
 %%%===================================================================
@@ -100,10 +109,13 @@ screen_string(String) when is_list(String) ->
 screen_orientation(I) when is_integer(I) ->
     json_command({struct,[{screen_orientation, I}]}).
 
-set_leds(Ls = [{_I,_M,_RGB}|_Leds]) ->
-    json_command({struct,[{led,{array,
-				[{struct,[{b,B},{g,G},{i,I},{m,M},{r,R}]} || 
-				    {I,M,{R,G,B}} <- Ls]}}]}).
+set_leds(Ls) ->
+    json_command(set_leds_command_(Ls)).
+
+set_leds_command_(Ls = [{_I,_M,_RGB}|_Leds]) ->
+    {struct,[{led,{array,
+		   [{struct,[{b,B},{g,G},{i,I},{m,M},{r,R}]} ||
+		       {I,M,{R,G,B}} <- Ls]}}]}.
 
 set_led(I,RGB) ->
     set_leds([{I,0,RGB}]).
@@ -159,8 +171,12 @@ init(Options) ->
 		     proplists:get_value(device, Options);
 		 {ok,D} -> D
 	     end,
+    Config = case application:get_env(egear, map) of
+		 undefined -> [];
+		 {ok,M} -> M
+	     end,
     {ok,U} = uart:open(Device, [{active,true},{packet,line},{baud, 115200}]),
-    {ok, #state{ device = Device, uart = U }}.
+    {ok, #state{ device = Device, uart = U, config = Config }}.
 
 %%--------------------------------------------------------------------
 %% @private
@@ -177,11 +193,8 @@ init(Options) ->
 %% @end
 %%--------------------------------------------------------------------
 handle_call({command, Command}, _From, State) ->
-    io:format("Json: ~p\n", [Command]),
-    Data = exo_json:encode(Command),
-    io:format("command = ~s\n", [Data]),
-    Reply = uart:send(State#state.uart, Data),
-    {reply, Reply, State};
+    {Reply,State1} = send_command_(Command, State),
+    {reply, Reply, State1};
 handle_call(stop, _From, State) ->
     uart:close(State#state.uart),
     {stop, normal, ok, State#state { uart=undefined }};
@@ -255,15 +268,25 @@ code_change(_OldVsn, State, _Extra) ->
 %%% Internal functions
 %%%===================================================================
 
+send_command_(Command, State) ->
+    io:format("Json: ~p\n", [Command]),
+    Data = exo_json:encode(Command),
+    io:format("command = ~s\n", [Data]),
+    Reply = uart:send(State#state.uart, Data),
+    {Reply,State}.
+
 handle_event({struct,[{"in",{array,Input}}]}, State) ->
     handle_input(Input, State);
 handle_event({struct,[{"l", Layout}]}, State) ->
-    {L,C} = decode_layout(Layout,[]),
+    {L,Is} = decode_layout(Layout,[]),
     io:format("Layout = ~p\n", [L]),
-    io:format("config = ~p\n", [C]),
+    io:format("Index_list = ~p\n", [Is]),
     Ls = format_layout(L),
     io:format("Layout pos = ~p\n", [Ls]),
-    State#state { layout = L, config = C };
+    %% format layout positions into grid
+    %% io:put_chars(render_layout(Ls)),
+    State1 = match_layout(L, Is, State),
+    State1#state { layout = L, index_list = Is };
 handle_event(_Event, State) ->
     State.
 
@@ -273,25 +296,25 @@ handle_input([{struct,Input} | Is], State) ->
 handle_input([], State) ->
     State.
 
-handle_inp(Input, State) when State#state.config =/= undefined ->
+handle_inp(Input, State) when State#state.index_list =/= undefined ->
     case Input of
 	[{"i",Index},{"v",{array,[Press,Backward,Forward,Value,
 				  _R1,_R2,_R3,_R4]}}] ->
-	    case lists:keyfind(Index,1,State#state.config) of
+	    case lists:keyfind(Index,#index.i,State#state.index_list) of
 		false ->
 		    io:format("device not found\n", []),
 		    State;
-		{_,?TYPE_SLIDER,Unique} ->
+		#index{t=?TYPE_SLIDER,u=Unique} ->
 		    io:format("slider[~s] value=~w\n", 
 			      [Unique,Press]),
 		    State;
-		{_,?TYPE_BUTTON,Unique} ->
+		#index{t=?TYPE_BUTTON,u=Unique} ->
 		    io:format("button[~s] state=~s\n", 
 			      [Unique,if Press =:= 1 -> pressed;
 					 true -> released
 				      end]),
 		    State;
-		{_,?TYPE_DIAL,Unique} ->
+		#index{t=?TYPE_DIAL,u=Unique} ->
 		    io:format("dial[~s] value=~w, direction=~s state=~s\n", 
 			      [Unique,Value,
 			       if Forward =:= 1 -> forward;
@@ -311,6 +334,21 @@ handle_inp(Input, State) when State#state.config =/= undefined ->
 handle_inp(_Input, State) ->
     State.
 
+match_layout(_Layout,Is,State) ->
+    match_index_list(Is, State).
+
+match_index_list([#index{i=I,u=U}|Is], State) ->
+    case lists:keyfind(U, 1, State#state.config) of
+	{U,color,RGB} ->
+	    Command = set_leds_command_([{I,0,RGB}]),
+	    {_Reply,State1} = send_command_(Command,State),
+	    match_index_list(Is, State1);
+	_ ->
+	    match_index_list(Is, State)
+    end;
+match_index_list([],State) ->
+    State.
+
 decode_layout({struct,[{"u",Unique},
 		       {"i",Index},
 		       {"t",Type},
@@ -319,7 +357,7 @@ decode_layout({struct,[{"u",Unique},
     { #layout { u = Unique,
 		i = Index,
 		t = Type,
-		c = Array }, [{Index,Type,Unique}|Conf1]}.
+		c = Array }, [#index{i=Index,t=Type,u=Unique}|Conf1]}.
 
 decode_layout_([null | As], Acc, Conf) ->
     decode_layout_(As, [null|Acc], Conf);
@@ -397,5 +435,5 @@ format_layout(Type,[UR,R,DR,DL,L],Pos,Mx,Acc=[{_,_,T,I}|_]) when
 %% |               |
 %% +---------------+
 %%
-render_layout(Pos) ->
-    ok.
+render_layout(_Ls) ->
+    "".
