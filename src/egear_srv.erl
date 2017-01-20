@@ -28,6 +28,9 @@
 -export([json_command/1]).
 -export([red/0, plain/3]).
 
+-export([subscribe/0,subscribe/1]).
+-export([unsubscribe/1]).
+
 -compile(export_all).
 
 %% gen_server callbacks
@@ -41,6 +44,13 @@
 -define(TYPE_SLIDER, 3).
 
 -define(SERVER, ?MODULE).
+
+-record(subscription,
+	{
+	  pid,
+	  mon,
+	  pattern
+	}).
 
 -record(layout,
 	{
@@ -71,7 +81,8 @@
 	  uart   :: port(),
 	  layout :: #layout{},
 	  index_list :: [#index{}],
-	  config :: [{Unique::string(),color,rgb()}]
+	  config :: [{Unique::string(),color,rgb()}],
+	  subs = []
 	}).
 
 %%%===================================================================
@@ -81,11 +92,43 @@
 start_link() ->
     gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
 
-start_link(Device) ->
-    gen_server:start_link({local, ?SERVER}, ?MODULE, [{device,Device}], []).
+start_link(Opts) ->
+    gen_server:start_link({local, ?SERVER}, ?MODULE, Opts, []).
 
 stop() ->
     gen_server:stop(?SERVER).
+
+%%--------------------------------------------------------------------
+%% @doc
+%% Subscribe to egear events.
+%%
+%% @end
+%%--------------------------------------------------------------------
+-spec subscribe(Pattern::[{atom(),string()}]) ->
+		       {ok,reference()} | {error, Error::term()}.
+subscribe(Pattern) ->
+    gen_server:call(?SERVER, {subscribe,self(),Pattern}).
+
+%%--------------------------------------------------------------------
+%% @doc
+%% Subscribe to egear events.
+%%
+%% @end
+%%--------------------------------------------------------------------
+-spec subscribe() -> {ok,reference()} | {error, Error::term()}.
+subscribe() ->
+    gen_server:call(?SERVER, {subscribe,self(),[]}).
+
+%%--------------------------------------------------------------------
+%% @doc
+%% Unsubscribe from egear events.
+%%
+%% @end
+%%--------------------------------------------------------------------
+-spec unsubscribe(Ref::reference()) -> ok | {error, Error::term()}.
+unsubscribe(Ref) ->
+    gen_server:call(?SERVER, {unsubscribe,Ref}).
+
 
 enable() ->
     json_command({struct,[{start,1}]}).
@@ -195,6 +238,14 @@ init(Options) ->
 handle_call({command, Command}, _From, State) ->
     {Reply,State1} = send_command_(Command, State),
     {reply, Reply, State1};
+handle_call({subscribe,Pid,Pattern},_From,State=#state { subs=Subs}) ->
+    Mon = erlang:monitor(process, Pid),
+    Subs1 = [#subscription { pid = Pid, mon = Mon, pattern = Pattern}|Subs],
+    {reply, {ok,Mon}, State#state { subs = Subs1}};
+handle_call({unsubscribe,Ref},_From,State) ->
+    erlang:demonitor(Ref),
+    State1 = remove_subscription(Ref,State),
+    {reply, ok, State1};
 handle_call(stop, _From, State) ->
     uart:close(State#state.uart),
     {stop, normal, ok, State#state { uart=undefined }};
@@ -227,7 +278,7 @@ handle_cast(_Msg, State) ->
 handle_info({uart,U,Data}, State) when U =:= State#state.uart ->
     try exo_json:decode_string(Data) of
 	{ok,Term} ->
-	    io:format("handle_info: ~p\n", [Term]),
+	    %% io:format("handle_info: ~p\n", [Term]),
 	    State1 = handle_event(Term, State),
 	    {noreply, State1}
     catch
@@ -235,6 +286,11 @@ handle_info({uart,U,Data}, State) when U =:= State#state.uart ->
 	    io:format("handle_info: error=~p, data=~p\n", [Error,Data]),
 	    {noreply, State}
     end;
+handle_info({'DOWN',Ref,process,_Pid,_Reason},State) ->
+    lager:debug("handle_info: subscriber ~p terminated: ~p", 
+		[_Pid, _Reason]),
+    State1 = remove_subscription(Ref,State),
+    {noreply, State1};
 handle_info(_Info, State) ->
     io:format("handle_info: ~p\n", [_Info]),
     {noreply, State}.
@@ -269,9 +325,9 @@ code_change(_OldVsn, State, _Extra) ->
 %%%===================================================================
 
 send_command_(Command, State) ->
-    io:format("Json: ~p\n", [Command]),
+    %% io:format("Json: ~p\n", [Command]),
     Data = exo_json:encode(Command),
-    io:format("command = ~s\n", [Data]),
+    %% io:format("command = ~s\n", [Data]),
     Reply = uart:send(State#state.uart, Data),
     {Reply,State}.
 
@@ -279,10 +335,10 @@ handle_event({struct,[{"in",{array,Input}}]}, State) ->
     handle_input(Input, State);
 handle_event({struct,[{"l", Layout}]}, State) ->
     {L,Is} = decode_layout(Layout,[]),
-    io:format("Layout = ~p\n", [L]),
-    io:format("Index_list = ~p\n", [Is]),
-    Ls = format_layout(L),
-    io:format("Layout pos = ~p\n", [Ls]),
+    %% io:format("Layout = ~p\n", [L]),
+    %% io:format("Index_list = ~p\n", [Is]),
+    _Ls = format_layout(L),
+    %% io:format("Layout pos = ~p\n", [Ls]),
     %% format layout positions into grid
     %% io:put_chars(render_layout(Ls)),
     State1 = match_layout(L, Is, State),
@@ -302,28 +358,35 @@ handle_inp(Input, State) when State#state.index_list =/= undefined ->
 				  _R1,_R2,_R3,_R4]}}] ->
 	    case lists:keyfind(Index,#index.i,State#state.index_list) of
 		false ->
-		    io:format("device not found\n", []),
+		    io:format("device index=~w not found\n", [Index]),
 		    State;
 		#index{t=?TYPE_SLIDER,u=Unique} ->
-		    io:format("slider[~s] value=~w\n", 
-			      [Unique,Press]),
+		    send_event(State#state.subs,
+			       [{type,slider},
+				{index,Index},
+				{id,Unique},
+				{value,Press}]),
 		    State;
 		#index{t=?TYPE_BUTTON,u=Unique} ->
-		    io:format("button[~s] state=~s\n", 
-			      [Unique,if Press =:= 1 -> pressed;
-					 true -> released
-				      end]),
+		    send_event(State#state.subs,
+			       [{type,button},
+				{index,Index},
+				{id,Unique},
+				{state,Press}
+			       ]),
 		    State;
 		#index{t=?TYPE_DIAL,u=Unique} ->
-		    io:format("dial[~s] value=~w, direction=~s state=~s\n", 
-			      [Unique,Value,
-			       if Forward =:= 1 -> forward;
-				  Backward =:= 1 -> backward;
-				  true -> none
-			       end,
-			       if Press =:= 1 -> pressed;
-				  true -> released
-			       end]),
+		    Dir = if Forward =:= 1 -> 1;
+			     Backward =:= 1 -> -1;
+			     true -> none
+			  end,
+		    send_event(State#state.subs,
+			       [{type,dial},
+				{index,Index},
+				{id,Unique},
+				{direction,Dir},
+				{state,Press},
+				{value,Value}]),
 		    State;
 		_ ->
 		    State
@@ -333,6 +396,27 @@ handle_inp(Input, State) when State#state.index_list =/= undefined ->
     end;
 handle_inp(_Input, State) ->
     State.
+
+send_event([#subscription{pid=Pid,mon=Ref,pattern=Pattern}|Tail], Event) ->
+    case match_event(Pattern, Event) of
+	true -> 
+	    io:format("Send event ~p\n", [Event]),
+	    Pid ! {egear_event,Ref,Event};
+	false -> 
+	    io:format("Ignore event ~p\n", [Event]),
+	    false
+    end,
+    send_event(Tail,Event);
+send_event([],_Event) ->
+    ok.
+
+match_event([], _) -> true;
+match_event([{Key,ValuePat}|Kvs],Event) ->
+    case lists:keyfind(Key, 1, Event) of
+	{Key,ValuePat} -> match_event(Kvs, Event);
+	_ -> false
+    end.
+
 
 match_layout(_Layout,Is,State) ->
     match_index_list(Is, State).
@@ -437,3 +521,7 @@ format_layout(Type,[UR,R,DR,DL,L],Pos,Mx,Acc=[{_,_,T,I}|_]) when
 %%
 render_layout(_Ls) ->
     "".
+
+remove_subscription(Ref, State=#state { subs=Subs}) ->
+    Subs1 = lists:keydelete(Ref, #subscription.mon, Subs),
+    State#state { subs = Subs1 }.
