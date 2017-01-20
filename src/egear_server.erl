@@ -6,7 +6,7 @@
 %%% @end
 %%% Created : 12 Jan 2017 by Tony Rogvall <tony@rogvall.se>
 %%%-------------------------------------------------------------------
--module(egear_srv).
+-module(egear_server).
 
 -behaviour(gen_server).
 
