@@ -219,7 +219,9 @@ init(Options) ->
 		 {ok,M} -> M
 	     end,
     {ok,U} = uart:open(Device, [{active,true},{packet,line},{baud, 115200}]),
-    {ok, #state{ device = Device, uart = U, config = Config }}.
+    S0 = #state{ device = Device, uart = U, config = Config },
+    {ok,S1} = send_command_({struct,[{start,1}]}, S0),
+    {ok, S1}.
 
 %%--------------------------------------------------------------------
 %% @private
