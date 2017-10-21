@@ -178,20 +178,41 @@ set_midimap(Map) ->
 set_version_screen(Version) ->
     json_command({struct,[{set_version_screen,Version}]}).
 
-screen_write(I, Data) ->
-    Data1 = base64:encode(Data),
-    json_command({struct,[{screen_write,I},{data,Data1}]}).
+screen_write(I, Data) when is_binary(Data), byte_size(Data) =:= 8240 ->
+    json_command({struct,[{screen_write,I}]},Data).
 
+%% construct an image of red pixels
 red() ->
     plain({255,0,0},128,128).
 
+green() ->
+    plain({0,255,0},128,128).
+
+blue() ->
+    plain({0,0,255},128,128).
+
+
+%% construct an imag with ONE palette entry
 plain({R,G,B},W,H) ->
-    Row = << <<R,G,B>> || _ <- lists:seq(1,W) >>,
-    Screen = << <<Row/binary>> || _ <- lists:seq(1,H) >>,
-    Screen.
+    %% 48 byte palette in BGR format
+    Palette = palette([{R,G,B}]),
+    Size = W*H*4,
+    <<Palette/binary, 0:Size>>.
+
+
+%% input a list of RGB tripple and output a palette of 48 bytes
+%% padded with 0 entries if needed
+palette(RGBs) ->
+    RGBs1 = lists:sublist(RGBs, 16),  %% make sure max 16 entries,
+    N = length(RGBs1),
+    ZEntries = << <<0,0,0>> || _ <- lists:seq(1,16-N) >>,
+    << << <<B,G,R>> || {R,G,B} <- RGBs1>>/binary, ZEntries/binary>>.
 
 json_command(Command) ->
     gen_server:call(?SERVER, {command, Command}).
+
+json_command(Command,Data) ->
+    gen_server:call(?SERVER, {command, Command, Data}).
 
 %%%===================================================================
 %%% gen_server callbacks
@@ -237,6 +258,9 @@ init(Options) ->
 %%--------------------------------------------------------------------
 handle_call({command, Command}, _From, State) ->
     {Reply,State1} = send_command_(Command, State),
+    {reply, Reply, State1};
+handle_call({command, Command,Data}, _From, State) ->
+    {Reply,State1} = send_command_(Command,Data,State),
     {reply, Reply, State1};
 handle_call({subscribe,Pid,Pattern},_From,State=#state { subs=Subs}) ->
     Mon = erlang:monitor(process, Pid),
@@ -326,10 +350,22 @@ code_change(_OldVsn, State, _Extra) ->
 
 send_command_(Command, State) ->
     %% io:format("Json: ~p\n", [Command]),
-    Data = exo_json:encode(Command),
-    %% io:format("command = ~s\n", [Data]),
-    Reply = uart:send(State#state.uart, Data),
+    CData = exo_json:encode(Command),
+    %% io:format("command = ~s\n", [CData]),
+    Reply = uart:send(State#state.uart, CData),
     {Reply,State}.
+
+send_command_(Command, Data, State) ->
+    %% io:format("Json: ~p\n", [Command]),
+    CData = exo_json:encode(Command),
+    %% io:format("command = ~s\n", [CData]),
+    case uart:send(State#state.uart, CData) of
+	ok ->
+	    Reply = uart:send(State#state.uart, Data),
+	    {Reply,State};
+	Error ->
+	    {Error,State}
+    end.
 
 handle_event({struct,[{"in",{array,Input}}]}, State) ->
     handle_input(Input, State);
