@@ -75,10 +75,13 @@
 %%
 -type rgb() :: {byte(),byte(),byte()}.
 
--record(state, 
+-record(s, 
 	{
 	  device :: string(),
 	  uart   :: port(),
+	  baud_rate = 115200 :: integer(),
+	  retry_interval = 5000 :: integer(),
+	  retry_timer :: reference(),
 	  layout :: #layout{},
 	  index_list :: [#index{}],
 	  config :: [{Unique::string(),color,rgb()}],
@@ -191,6 +194,8 @@ green() ->
 blue() ->
     plain({0,0,255},128,128).
 
+    
+
 
 %% construct an imag with ONE palette entry
 plain({R,G,B},W,H) ->
@@ -235,14 +240,30 @@ init(Options) ->
 		     proplists:get_value(device, Options);
 		 {ok,D} -> D
 	     end,
+    BaudRate = case application:get_env(egear, baud_rate) of
+		   undefined ->
+		       proplists:get_value(baud_rate, Options, 
+					   (#s{})#s.baud_rate);
+		   {ok,BR} -> BR
+	       end,
+    RetryInterval = case application:get_env(egear, retry_interval) of
+			undefined ->
+			    proplists:get_value(retry_interval, Options, 
+						(#s{})#s.retry_interval);
+			{ok,RI} -> RI
+		    end,
     Config = case application:get_env(egear, map) of
 		 undefined -> [];
 		 {ok,M} -> M
 	     end,
-    {ok,U} = uart:open(Device, [{active,true},{packet,line},{baud, 115200}]),
-    S0 = #state{ device = Device, uart = U, config = Config },
-    {ok,S1} = send_command_({struct,[{start,1}]}, S0),
-    {ok, S1}.
+    S = #s { device = Device,
+	     retry_interval = RetryInterval,
+	     baud_rate = BaudRate,
+	     config=Config },
+    case open(S) of
+	{ok, S1} -> {ok, S1};
+	{Error, _S1} -> {stop, Error}
+    end.
 
 %%--------------------------------------------------------------------
 %% @private
@@ -258,25 +279,25 @@ init(Options) ->
 %%                                   {stop, Reason, State}
 %% @end
 %%--------------------------------------------------------------------
-handle_call({command, Command}, _From, State) ->
-    {Reply,State1} = send_command_(Command, State),
-    {reply, Reply, State1};
-handle_call({command, Command,Data}, _From, State) ->
-    {Reply,State1} = send_command_(Command,Data,State),
-    {reply, Reply, State1};
-handle_call({subscribe,Pid,Pattern},_From,State=#state { subs=Subs}) ->
+handle_call({command, Command}, _From, S) ->
+    {Reply,S1} = send_command_(Command, S),
+    {reply, Reply, S1};
+handle_call({command, Command,Data}, _From, S) ->
+    {Reply,S1} = send_command_(Command,Data,S),
+    {reply, Reply, S1};
+handle_call({subscribe,Pid,Pattern},_From,S=#s { subs=Subs}) ->
     Mon = erlang:monitor(process, Pid),
     Subs1 = [#subscription { pid = Pid, mon = Mon, pattern = Pattern}|Subs],
-    {reply, {ok,Mon}, State#state { subs = Subs1}};
-handle_call({unsubscribe,Ref},_From,State) ->
+    {reply, {ok,Mon}, S#s { subs = Subs1}};
+handle_call({unsubscribe,Ref},_From,S) ->
     erlang:demonitor(Ref),
-    State1 = remove_subscription(Ref,State),
-    {reply, ok, State1};
-handle_call(stop, _From, State) ->
-    uart:close(State#state.uart),
-    {stop, normal, ok, State#state { uart=undefined }};
-handle_call(_Request, _From, State) ->
-    {reply, {error,bad_request}, State}.
+    S1 = remove_subscription(Ref,S),
+    {reply, ok, S1};
+handle_call(stop, _From, S) ->
+    uart:close(S#s.uart),
+    {stop, normal, ok, S#s { uart=undefined }};
+handle_call(_Request, _From, S) ->
+    {reply, {error,bad_request}, S}.
 
 %%--------------------------------------------------------------------
 %% @private
@@ -288,8 +309,8 @@ handle_call(_Request, _From, State) ->
 %%                                  {stop, Reason, State}
 %% @end
 %%--------------------------------------------------------------------
-handle_cast(_Msg, State) ->
-    {noreply, State}.
+handle_cast(_Msg, S) ->
+    {noreply, S}.
 
 %%--------------------------------------------------------------------
 %% @private
@@ -301,25 +322,44 @@ handle_cast(_Msg, State) ->
 %%                                   {stop, Reason, State}
 %% @end
 %%--------------------------------------------------------------------
-handle_info({uart,U,Data}, State) when U =:= State#state.uart ->
+handle_info({uart,U,Data}, S) when U =:= S#s.uart ->
     try exo_json:decode_string(Data) of
 	{ok,Term} ->
-	    %% io:format("handle_info: ~p\n", [Term]),
-	    State1 = handle_event(Term, State),
-	    {noreply, State1}
+	    S1 = handle_event(Term, S),
+	    {noreply, S1}
     catch
 	error:Error ->
-	    io:format("handle_info: error=~p, data=~p\n", [Error,Data]),
-	    {noreply, State}
+	    debug("handle_info: error=~p, data=~p", [Error,Data]),
+	    {noreply, S}
     end;
-handle_info({'DOWN',Ref,process,_Pid,_Reason},State) ->
+handle_info({uart_error,U,Reason}, S) when S#s.uart =:= U ->
+    if Reason =:= enxio ->
+	    debug("maybe unplugged?", []),
+	    {noreply, reopen(S)};
+       true ->
+	    debug("uart error=~p", [Reason]),
+	    {noreply, S}
+    end;
+handle_info({uart_closed,U}, S) when U =:= S#s.uart ->
+    debug("uart_closed: reopen in ~w",[S#s.retry_interval]),
+    S1 = reopen(S),
+    {noreply, S1};
+handle_info({timeout,TRef,reopen},S) 
+  when TRef =:= S#s.retry_timer ->
+    case open(S#s { retry_timer = undefined }) of
+	{ok, S1} ->
+	    {noreply, S1};
+	{Error, S1} ->
+	    {stop, Error, S1}
+    end;
+handle_info({'DOWN',Ref,process,_Pid,_Reason},S) ->
     lager:debug("handle_info: subscriber ~p terminated: ~p", 
 		[_Pid, _Reason]),
-    State1 = remove_subscription(Ref,State),
-    {noreply, State1};
-handle_info(_Info, State) ->
-    io:format("handle_info: ~p\n", [_Info]),
-    {noreply, State}.
+    S1 = remove_subscription(Ref,S),
+    {noreply, S1};
+handle_info(_Info, S) ->
+    debug("handle_info: ~p", [_Info]),
+    {noreply, S}.
 
 %%--------------------------------------------------------------------
 %% @private
@@ -332,7 +372,7 @@ handle_info(_Info, State) ->
 %% @spec terminate(Reason, State) -> void()
 %% @end
 %%--------------------------------------------------------------------
-terminate(_Reason, _State) ->
+terminate(_Reason, _S) ->
     ok.
 
 %%--------------------------------------------------------------------
@@ -343,97 +383,89 @@ terminate(_Reason, _State) ->
 %% @spec code_change(OldVsn, State, Extra) -> {ok, NewState}
 %% @end
 %%--------------------------------------------------------------------
-code_change(_OldVsn, State, _Extra) ->
-    {ok, State}.
+code_change(_OldVsn, S, _Extra) ->
+    {ok, S}.
 
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
 
-send_command_(Command, State) ->
-    %% io:format("Json: ~p\n", [Command]),
+send_command_(Command, S) ->
     CData = exo_json:encode(Command),
-    %% io:format("command = ~s\n", [CData]),
-    Reply = uart:send(State#state.uart, CData),
-    {Reply,State}.
+    Reply = uart:send(S#s.uart, CData),
+    {Reply,S}.
 
-send_command_(Command, Data, State) ->
-    %% io:format("Json: ~p\n", [Command]),
+send_command_(Command, Data, S) ->
     CData = exo_json:encode(Command),
-    %% io:format("command = ~s\n", [CData]),
-    case uart:send(State#state.uart, CData) of
+    case uart:send(S#s.uart, CData) of
 	ok ->
-	    Reply = uart:send(State#state.uart, Data),
-	    {Reply,State};
+	    Reply = uart:send(S#s.uart, Data),
+	    {Reply,S};
 	Error ->
-	    {Error,State}
+	    {Error,S}
     end.
 
-handle_event({struct,[{"in",{array,Input}}]}, State) ->
-    handle_input(Input, State);
-handle_event({struct,[{"l", Layout}]}, State) ->
+handle_event({struct,[{"in",{array,Input}}]}, S) ->
+    handle_input(Input, S);
+handle_event({struct,[{"l", Layout}]}, S) ->
     {L,Is} = decode_layout(Layout,[]),
-    %% io:format("Layout = ~p\n", [L]),
-    %% io:format("Index_list = ~p\n", [Is]),
     _Ls = format_layout(L),
-    %% io:format("Layout pos = ~p\n", [Ls]),
-    %% format layout positions into grid
-    %% io:put_chars(render_layout(Ls)),
-    State1 = match_layout(L, Is, State),
-    State1#state { layout = L, index_list = Is };
-handle_event(_Event, State) ->
-    State.
+    S1 = match_layout(L, Is, S),
+    S1#s { layout = L, index_list = Is };
+handle_event(_Event, S) ->
+    S.
 
-handle_input([{struct,Input} | Is], State) ->
-    State1 = handle_inp(Input, State),
-    handle_input(Is,State1);
-handle_input([], State) ->
-    State.
+handle_input([{struct,Input} | Is], S) ->
+    S1 = handle_inp(Input, S),
+    handle_input(Is,S1);
+handle_input([], S) ->
+    S.
 
-handle_inp(Input, State) when State#state.index_list =/= undefined ->
+handle_inp(Input, S) when S#s.index_list =/= undefined ->
+    debug("input ~p\n", [Input]),
     case Input of
 	[{"i",Index},{"v",{array,[Press,Backward,Forward,Value,
 				  _R1,_R2,_R3,_R4]}}] ->
-	    case lists:keyfind(Index,#index.i,State#state.index_list) of
+	    case lists:keyfind(Index,#index.i,S#s.index_list) of
 		false ->
 		    io:format("device index=~w not found\n", [Index]),
-		    State;
+		    S;
 		#index{t=?TYPE_SLIDER,u=Unique} ->
-		    send_event(State#state.subs,
+		    send_event(S#s.subs,
 			       [{type,slider},
 				{index,Index},
 				{id,Unique},
 				{value,Press}]),
-		    State;
+		    S;
 		#index{t=?TYPE_BUTTON,u=Unique} ->
-		    send_event(State#state.subs,
+		    send_event(S#s.subs,
 			       [{type,button},
 				{index,Index},
 				{id,Unique},
 				{state,Press}
 			       ]),
-		    State;
+		    S;
 		#index{t=?TYPE_DIAL,u=Unique} ->
 		    Dir = if Forward =:= 1 -> 1;
 			     Backward =:= 1 -> -1;
 			     true -> none
 			  end,
-		    send_event(State#state.subs,
+		    send_event(S#s.subs,
 			       [{type,dial},
 				{index,Index},
 				{id,Unique},
 				{direction,Dir},
 				{state,Press},
 				{value,Value}]),
-		    State;
+		    S;
 		_ ->
-		    State
+		    S
 	    end;
 	_ ->
-	    State
+	    S
     end;
-handle_inp(_Input, State) ->
-    State.
+handle_inp(_Input, S) ->
+    S.
 
 send_event([#subscription{pid=Pid,mon=Ref,pattern=Pattern}|Tail], Event) ->
     case match_event(Pattern, Event) of
@@ -456,20 +488,20 @@ match_event([{Key,ValuePat}|Kvs],Event) ->
     end.
 
 
-match_layout(_Layout,Is,State) ->
-    match_index_list(Is, State).
+match_layout(_Layout,Is,S) ->
+    match_index_list(Is, S).
 
-match_index_list([#index{i=I,u=U}|Is], State) ->
-    case lists:keyfind(U, 1, State#state.config) of
+match_index_list([#index{i=I,u=U}|Is], S) ->
+    case lists:keyfind(U, 1, S#s.config) of
 	{U,color,RGB} ->
 	    Command = set_leds_command_([{I,0,RGB}]),
-	    {_Reply,State1} = send_command_(Command,State),
-	    match_index_list(Is, State1);
+	    {_Reply,S1} = send_command_(Command,S),
+	    match_index_list(Is, S1);
 	_ ->
-	    match_index_list(Is, State)
+	    match_index_list(Is, S)
     end;
-match_index_list([],State) ->
-    State.
+match_index_list([],S) ->
+    S.
 
 decode_layout({struct,[{"u",Unique},
 		       {"i",Index},
@@ -560,6 +592,188 @@ format_layout(Type,[UR,R,DR,DL,L],Pos,Mx,Acc=[{_,_,T,I}|_]) when
 render_layout(_Ls) ->
     "".
 
-remove_subscription(Ref, State=#state { subs=Subs}) ->
+remove_subscription(Ref, S=#s { subs=Subs}) ->
     Subs1 = lists:keydelete(Ref, #subscription.mon, Subs),
-    State#state { subs = Subs1 }.
+    S#s { subs = Subs1 }.
+
+
+open(S0=#s { device = DeviceName, baud_rate = Baud }) ->
+    UartOpts = [{baud, Baud}, {packet, line},
+		{csize, 8}, {stopb,1}, {parity,none}, {active, true}],
+    case uart:open1(DeviceName, UartOpts) of
+	{ok,U} ->
+	    debug("~s@~w", [DeviceName,Baud]),
+	    send_command_({struct,[{start,1}]}, S0#s{uart=U});
+
+	{error,E} when E =:= eaccess; E =:= enoent; E =:= ebusy ->
+	    if is_integer(S0#s.retry_interval), S0#s.retry_interval > 0 ->
+		    debug("~s@~w  error ~w, will try again in ~p msecs.", 
+			  [DeviceName,Baud,E,S0#s.retry_interval]),
+		    {ok, reopen(S0)};
+	       true ->
+		    {E, S0}
+	    end;
+	{error, E} ->
+	    {E, S0}
+    end.
+
+reopen(S=#s {device = DeviceName}) ->
+    if S#s.uart =/= undefined ->
+	    debug("closing device ~s", [DeviceName]),
+	    R = uart:close(S#s.uart),
+	    debug("closed ~p", [R]),
+	    R;
+       true ->
+	    ok
+    end,
+    T = erlang:max(100, S#s.retry_interval),
+    Timer = start_timer(T, reopen),
+    S#s { uart=undefined, retry_timer=Timer }.
+
+start_timer(undefined, _Tag) ->
+    undefined;
+start_timer(infinity, _Tag) ->
+    undefined;
+start_timer(Time, Tag) ->
+    erlang:start_timer(Time,self(),Tag).
+
+debug(Fmt, Args) ->
+    io:format(Fmt++"\n", Args).
+
+erlang() ->
+    xpm([{$\s,0,{255,255,255}},
+	 {$.,1,{16#8c,16#00,16#2f}},
+	 {$+,2,{16#00,16#00,16#00}}],
+[
+ "                                                                                                                                ",
+ " .................                                                                                             ................ ",
+ " ................                                                                                               ............... ",
+ " ...............                                           ...........                                           .............. ",
+ " ..............                                          ................                                        .............. ",
+ " ..............                                        ....................                                       ............. ",
+ " .............                                        ......................                                      ............. ",
+ " ............                                        ........................                                      ............ ",
+ " ............                                       ..........................                                     ............ ",
+ " ...........                                       ...........................                                      ........... ",
+ " ...........                                      .............................                                     ........... ",
+ " ..........                                       ..............................                                     .......... ",
+ " ..........                                      ...............................                                     .......... ",
+ " .........                                       ...............................                                     .......... ",
+ " .........                                      ................................                                      ......... ",
+ " .........                                      .................................                                     ......... ",
+ " ........                                       .................................                                     ......... ",
+ " ........                                      ..................................                                     ......... ",
+ " .......                                       ..................................                                      ........ ",
+ " .......                                                                                                               ........ ",
+ " .......                                                                                                               ........ ",
+ " ......                                                                                                                ........ ",
+ " ......                                                                                                                ........ ",
+ " ......                                                                                                                 ....... ",
+ " ......                                                                                                                 ....... ",
+ " ......                                                                                                                 ....... ",
+ " .....                                                                                                                  ....... ",
+ " .....                                                                                                                  ....... ",
+ " .....                                                                                                                  ....... ",
+ " .....                                                                                                                  ....... ",
+ " .....                                                                                                                  ....... ",
+ " ....                                                                                                                   ....... ",
+ " ....                                                                                                                   ....... ",
+ " ....                                                                                                                   ....... ",
+ " ....                                                                                                                   ....... ",
+ " ....                                                                                                                   ....... ",
+ " ....                                                                                                                   ....... ",
+ " ....                                                                                                                   ....... ",
+ " ....                                         ................................................................................. ",
+ " ....                                         ................................................................................. ",
+ " ....                                         ................................................................................. ",
+ " ....                                         ................................................................................. ",
+ " ....                                         ................................................................................. ",
+ " ....                                         ................................................................................. ",
+ " ....                                          ................................................................................ ",
+ " ....                                          ................................................................................ ",
+ " ....                                          ................................................................................ ",
+ " .....                                         ................................................................................ ",
+ " .....                                         ................................................................................ ",
+ " .....                                         ................................................................................ ",
+ " .....                                         ................................................................................ ",
+ " .....                                         ................................................................................ ",
+ " .....                                          ............................................................................... ",
+ " ......                                         ............................................................................... ",
+ " ......                                         ............................................................................... ",
+ " ......                                         ............................................................................... ",
+ " ......                                          ......................................................  ...................... ",
+ " .......                                         ......................................................    .................... ",
+ " .......                                         .....................................................       .................. ",
+ " .......                                          ....................................................         ................ ",
+ " .......                                          ...................................................            .............. ",
+ " ........                                         ..................................................               ............ ",
+ " ........                                          ................................................                  .......... ",
+ " .........                                         ...............................................                     ........ ",
+ " .........                                          ..............................................                       ...... ",
+ " .........                                           ............................................                          .... ",
+ " ..........                                          ...........................................                          ..... ",
+ " ..........                                           .........................................                           ..... ",
+ " ...........                                           .......................................                           ...... ",
+ " ...........                                            .....................................                           ....... ",
+ " ............                                            ..................................                             ....... ",
+ " ............                                             ................................                             ........ ",
+ " .............                                             .............................                              ......... ",
+ " ..............                                              ..........................                               ......... ",
+ " ..............                                               .......................                                .......... ",
+ " ...............                                                 .................                                  ........... ",
+ " ................                                                    .........                                     ............ ",
+ " ................                                                                                                  ............ ",
+ " .................                                                                                                ............. ",
+ " ..................                                                                                              .............. ",
+ " ...................                                                                                            ............... ",
+ "                                                                                                                                ",
+ "                                                                                                                                ",
+ "                                                                                                                                ",
+ "                                                                                                                                ",
+ "                                                                                                                                ",
+ "                                                                                                                                ",
+ "                                                                                                                   +++++        ",
+ " ++++++++++          +++++++++            ++++                    ++++              ++++         +++++           ++++++++++     ",
+ " ++++++++++          ++++++++++           ++++                   +++++              ++++         +++++          ++++++++++++    ",
+ " ++++++++++          +++++++++++          ++++                   ++++++             +++++        +++++         ++++++++++++++   ",
+ " ++++                ++++   ++++          ++++                   ++++++             ++++++       +++++        +++++      +++++  ",
+ " ++++                ++++   +++++         ++++                  +++++++             +++++++      +++++       +++++        +++   ",
+ " ++++                ++++    ++++         ++++                  ++++++++            ++++++++     +++++       ++++         +     ",
+ " ++++                ++++    ++++         ++++                 ++++ ++++            ++++++++     +++++      +++++               ",
+ " ++++                ++++   ++++          ++++                 ++++ ++++            ++++ ++++    +++++      ++++                ",
+ " ++++++++++          ++++  +++++          ++++                 +++   ++++           ++++  ++++   +++++      ++++                ",
+ " ++++++++++          ++++++++++           ++++                ++++   ++++           ++++   ++++  +++++      ++++      +++++++++ ",
+ " ++++++++++          ++++++++++           ++++                ++++   +++++          ++++   ++++  +++++      ++++      +++++++++ ",
+ " ++++                ++++++++             ++++                ++++    ++++          ++++    ++++ +++++      ++++      +++++++++ ",
+ " ++++                +++++++++            ++++               +++++++++++++          ++++     +++++++++      +++++         ++++  ",
+ " ++++                ++++ ++++            ++++               ++++++++++++++         ++++      ++++++++       ++++         ++++  ",
+ " ++++                ++++ +++++           ++++              +++++++++++++++         ++++       +++++++       +++++        ++++  ",
+ " ++++                ++++  +++++          ++++              +++++      ++++         ++++       +++++++        +++++      +++++  ",
+ " ++++++++++          ++++  +++++          ++++++++++        ++++        ++++        ++++        ++++++        ++++++   ++++++   ",
+ " ++++++++++          ++++   +++++         ++++++++++       ++++         ++++        ++++         +++++         +++++++++++++    ",
+ " ++++++++++          ++++    +++++        ++++++++++       ++++         +++++       ++++          ++++          +++++++++++     ",
+ " ++++++++++          ++++    +++++        +++++++++        +++           ++++        +++           ++             ++++++++      ",
+ "                                                                                                                                "	
+ ]).
+
+xpm(XPMPalette,XPM) ->
+    Palette = palette([Color||{_Char,_Index,Color} <- XPMPalette]),
+    Data = xpm_rows(XPMPalette,XPM,128,[]),
+    Pixmap = << <<I:4>> || I <- Data>>,
+    <<Palette/binary, Pixmap/binary>>.
+
+xpm_rows(_Palette, _, 0, Data) -> 
+    lists:append(Data);
+xpm_rows(Palette, [R|Rs], I, Data) ->
+    D = xpm_row(Palette, R, 128, []),
+    xpm_rows(Palette, Rs, I-1, [D|Data]);
+xpm_rows(Palette, [], I, Data) ->
+    xpm_rows(Palette, [], I-1, [lists:duplicate(128,0)|Data]).
+
+xpm_row(_Palette,_Cs,0,Data) ->
+    lists:reverse(Data);
+xpm_row(Palette,[C|Cs],J,Data) ->
+    {_,I,_Color} = lists:keyfind(C,1,Palette),
+    xpm_row(Palette,Cs,J-1,[I|Data]);
+xpm_row(Palette,[],J,Data) ->
+    xpm_row(Palette,[],J-1,[0|Data]).
