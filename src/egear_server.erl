@@ -11,31 +11,21 @@
 -behaviour(gen_server).
 
 %% API
--export([start_link/1, start_link/0]).
--export([screen_display/1]).
--export([screen_write/2]).
--export([screen_ready/1]).
--export([screen_string/1]).
--export([screen_orientation/1]).
--export([set_hidmap/1]).
--export([set_joymap/1]).
--export([set_midimap/1]).
--exprot([set_leds/1]).
--exprot([set_led/2]).
--exprot([set_led/3]).
--export([send_version/0]).
--export([enable/0, disable/0]).
--export([json_command/1]).
--export([red/0, plain/3]).
+-export([start_link/1, start_link/0, stop/0]).
+-export([json_command/2]).
+-export([json_command/3]).
 
--export([subscribe/0,subscribe/1]).
--export([unsubscribe/1]).
+-export([subscribe/1,subscribe/2]).
+-export([unsubscribe/2]).
 
--compile(export_all).
+-export([make_leds_command/1]).
+-export([get_layout/1]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
 	 terminate/2, code_change/3]).
+
+-include("egear.hrl").
 
 %% type (t) parameter
 -define(TYPE_SCREEN, 0).
@@ -43,7 +33,8 @@
 -define(TYPE_DIAL,   2).
 -define(TYPE_SLIDER, 3).
 
--define(SERVER, ?MODULE).
+%% -define(debug(Fmt,Args), io:format((Fmt)++"\n", (Args))).
+-define(debug(Fmt,Args), ok).
 
 -record(subscription,
 	{
@@ -52,18 +43,11 @@
 	  pattern
 	}).
 
--record(layout,
-	{
-	  u :: string(),  %% unique number for the device
-	  i :: integer(), %% sequential index with in current config
-	  t :: integer(), %% type TYPE_x
-	  c :: [null|#layout{}]  %% config
-	}).
 
 -record(index,
 	{
 	  i :: integer(),
-	  t :: integer(),
+	  t :: item_type(),
 	  u :: string()
 	}).
 %%
@@ -73,9 +57,8 @@
 %% DIAL array [Right,Down,Left]
 %% SLIDER array = [UpRight,Right,DownRight,DownLeft,Left]
 %%
--type rgb() :: {byte(),byte(),byte()}.
 
--record(s, 
+-record(state, 
 	{
 	  device :: string(),
 	  uart   :: port(),
@@ -84,7 +67,8 @@
 	  retry_timer :: reference(),
 	  layout :: #layout{},
 	  index_list :: [#index{}],
-	  config :: [{Unique::string(),color,rgb()}],
+	  config :: [{Unique::string(),color,color()}],
+	  screen = undefined, %% screen to set at startup
 	  subs = []
 	}).
 
@@ -107,10 +91,10 @@ stop() ->
 %%
 %% @end
 %%--------------------------------------------------------------------
--spec subscribe(Pattern::[{atom(),string()}]) ->
+-spec subscribe(Pid::pid(), Pattern::[{atom(),string()}]) ->
 		       {ok,reference()} | {error, Error::term()}.
-subscribe(Pattern) ->
-    gen_server:call(?SERVER, {subscribe,self(),Pattern}).
+subscribe(Pid, Pattern) ->
+    gen_server:call(Pid, {subscribe,self(),Pattern}).
 
 %%--------------------------------------------------------------------
 %% @doc
@@ -118,9 +102,9 @@ subscribe(Pattern) ->
 %%
 %% @end
 %%--------------------------------------------------------------------
--spec subscribe() -> {ok,reference()} | {error, Error::term()}.
-subscribe() ->
-    gen_server:call(?SERVER, {subscribe,self(),[]}).
+-spec subscribe(Pid::pid()) -> {ok,reference()} | {error, Error::term()}.
+subscribe(Pid) ->
+    gen_server:call(Pid, {subscribe,self(),[]}).
 
 %%--------------------------------------------------------------------
 %% @doc
@@ -128,97 +112,23 @@ subscribe() ->
 %%
 %% @end
 %%--------------------------------------------------------------------
--spec unsubscribe(Ref::reference()) -> ok | {error, Error::term()}.
-unsubscribe(Ref) ->
-    gen_server:call(?SERVER, {unsubscribe,Ref}).
+-spec unsubscribe(Pid::pid(), Ref::reference()) -> ok | {error, Error::term()}.
+unsubscribe(Pid, Ref) ->
+    gen_server:call(Pid, {unsubscribe,Ref}).
 
+-spec json_command(Pid::pid(), Command::json()) -> ok | {error, Error::term()}.
+json_command(Pid,Command) ->
+    gen_server:call(Pid, {command, Command}).
 
-enable() ->
-    json_command({struct,[{start,1}]}).
+-spec json_command(Pid::pid(), Command::json(),Data::binary()) ->
+			  ok | {error, Error::term()}.
+json_command(Pid,Command,Data) ->
+    gen_server:call(Pid,{command, Command, Data}).
 
-disable() ->
-    json_command({struct,[{stop,1}]}).
+-spec get_layout(Pid::pid()) -> {ok,Layout::#layout{}}.
 
-send_version() ->
-    json_command({struct,[{send_version,1}]}).
-
-%% set/show screen number I
-screen_display(I) when is_integer(I) ->
-    json_command({struct,[{screen_display,I}]}).
-
-screen_ready(I) ->
-    json_command({struct,[{screen_ready,I}]}).
-
-screen_string(String) when is_list(String) ->
-    json_command({struct,[{screen_string,String}]}).
-
-screen_orientation(I) when is_integer(I) ->
-    json_command({struct,[{screen_orientation, I}]}).
-
-set_leds(Ls) ->
-    json_command(set_leds_command_(Ls)).
-
-set_leds_command_(Ls = [{_I,_M,_RGB}|_Leds]) ->
-    {struct,[{led,{array,
-		   [{struct,[{b,B},{g,G},{i,I},{m,M},{r,R}]} ||
-		       {I,M,{R,G,B}} <- Ls]}}]}.
-
-set_led(I,RGB) ->
-    set_leds([{I,0,RGB}]).
-
-set_led(I,M,RGB) ->
-    set_leds([{I,M,RGB}]).
-
-set_hidmap(Map) ->
-    json_command({struct,[{set_hidmap, Map}]}).
-
-set_joymap(Map) ->
-    json_command({struct,[{set_joymap, Map}]}).
-
-set_midimap(Map) ->
-    json_command({struct,[{set_midimap, Map}]}).
-
-set_version_screen(Version) ->
-    json_command({struct,[{set_version_screen,Version}]}).
-
-screen_write(I, Data) when is_binary(Data), byte_size(Data) =:= 8240 ->
-    json_command({struct,[{screen_write,I}]},Data).
-
-%% construct an image of red pixels
-red() ->
-    plain({255,0,0},128,128).
-
-green() ->
-    plain({0,255,0},128,128).
-
-blue() ->
-    plain({0,0,255},128,128).
-
-    
-
-
-%% construct an imag with ONE palette entry
-plain({R,G,B},W,H) ->
-    %% 48 byte palette in BGR format
-    Palette = palette([{R,G,B}]),
-    Size = W*H*4,
-    <<Palette/binary, 0:Size>>.
-
-
-%% input a list of RGB tripple and output a palette of 48 bytes
-%% padded with 0 entries if needed
-palette(RGBs) ->
-    RGBs1 = lists:sublist(RGBs, 16),  %% make sure max 16 entries,
-    N = length(RGBs1),
-    ZEntries = << <<0,0,0>> || _ <- lists:seq(1,16-N) >>,
-    << << <<B,G,R>> || {R,G,B} <- RGBs1>>/binary, ZEntries/binary>>.
-
-json_command(Command) ->
-    gen_server:call(?SERVER, {command, Command}).
-
-json_command(Command,Data) ->
-    gen_server:call(?SERVER, {command, Command, Data}).
-
+get_layout(Pid) ->
+    gen_server:call(Pid,get_layout).
 %%%===================================================================
 %%% gen_server callbacks
 %%%===================================================================
@@ -240,26 +150,35 @@ init(Options) ->
 		     proplists:get_value(device, Options);
 		 {ok,D} -> D
 	     end,
+    DefaultBaudRate = (#state{})#state.baud_rate,
     BaudRate = case application:get_env(egear, baud_rate) of
 		   undefined ->
 		       proplists:get_value(baud_rate, Options, 
-					   (#s{})#s.baud_rate);
+					   DefaultBaudRate);
 		   {ok,BR} -> BR
 	       end,
+    DefaultRetryInterval = (#state{})#state.retry_interval,
     RetryInterval = case application:get_env(egear, retry_interval) of
 			undefined ->
 			    proplists:get_value(retry_interval, Options, 
-						(#s{})#s.retry_interval);
+						DefaultRetryInterval);
 			{ok,RI} -> RI
 		    end,
     Config = case application:get_env(egear, map) of
 		 undefined -> [];
-		 {ok,M} -> M
+		 {ok,M} ->
+		     [{string:trim(U),K,V}||{U,K,V}<-M]
 	     end,
-    S = #s { device = Device,
-	     retry_interval = RetryInterval,
-	     baud_rate = BaudRate,
-	     config=Config },
+    Screen = case application:get_env(egeat, screen) of
+		 undefined -> undefined;
+		 {ok,Scr} -> Scr
+	     end,
+    S = #state { device = Device,
+		 retry_interval = RetryInterval,
+		 baud_rate = BaudRate,
+		 config = Config,
+		 screen = Screen
+	       },
     case open(S) of
 	{ok, S1} -> {ok, S1};
 	{Error, _S1} -> {stop, Error}
@@ -285,17 +204,19 @@ handle_call({command, Command}, _From, S) ->
 handle_call({command, Command,Data}, _From, S) ->
     {Reply,S1} = send_command_(Command,Data,S),
     {reply, Reply, S1};
-handle_call({subscribe,Pid,Pattern},_From,S=#s { subs=Subs}) ->
+handle_call({subscribe,Pid,Pattern},_From,S=#state { subs=Subs}) ->
     Mon = erlang:monitor(process, Pid),
     Subs1 = [#subscription { pid = Pid, mon = Mon, pattern = Pattern}|Subs],
-    {reply, {ok,Mon}, S#s { subs = Subs1}};
+    {reply, {ok,Mon}, S#state { subs = Subs1}};
 handle_call({unsubscribe,Ref},_From,S) ->
     erlang:demonitor(Ref),
     S1 = remove_subscription(Ref,S),
     {reply, ok, S1};
+handle_call(get_layout,_From,S) ->
+    {reply, {ok,S#state.layout}, S};
 handle_call(stop, _From, S) ->
-    uart:close(S#s.uart),
-    {stop, normal, ok, S#s { uart=undefined }};
+    uart:close(S#state.uart),
+    {stop, normal, ok, S#state { uart=undefined }};
 handle_call(_Request, _From, S) ->
     {reply, {error,bad_request}, S}.
 
@@ -322,31 +243,31 @@ handle_cast(_Msg, S) ->
 %%                                   {stop, Reason, State}
 %% @end
 %%--------------------------------------------------------------------
-handle_info({uart,U,Data}, S) when U =:= S#s.uart ->
+handle_info({uart,U,Data}, S) when U =:= S#state.uart ->
     try exo_json:decode_string(Data) of
 	{ok,Term} ->
 	    S1 = handle_event(Term, S),
 	    {noreply, S1}
     catch
-	error:Error ->
-	    debug("handle_info: error=~p, data=~p", [Error,Data]),
+	error:_Error ->
+	    ?debug("handle_info: error=~p, data=~p", [_Error,Data]),
 	    {noreply, S}
     end;
-handle_info({uart_error,U,Reason}, S) when S#s.uart =:= U ->
+handle_info({uart_error,U,Reason}, S) when S#state.uart =:= U ->
     if Reason =:= enxio ->
-	    debug("maybe unplugged?", []),
+	    ?debug("maybe unplugged?", []),
 	    {noreply, reopen(S)};
        true ->
-	    debug("uart error=~p", [Reason]),
+	    lager:warning("uart error=~p", [Reason]),
 	    {noreply, S}
     end;
-handle_info({uart_closed,U}, S) when U =:= S#s.uart ->
-    debug("uart_closed: reopen in ~w",[S#s.retry_interval]),
+handle_info({uart_closed,U}, S) when U =:= S#state.uart ->
+    lager:info("uart_closed: reopen in ~w",[S#state.retry_interval]),
     S1 = reopen(S),
     {noreply, S1};
 handle_info({timeout,TRef,reopen},S) 
-  when TRef =:= S#s.retry_timer ->
-    case open(S#s { retry_timer = undefined }) of
+  when TRef =:= S#state.retry_timer ->
+    case open(S#state { retry_timer = undefined }) of
 	{ok, S1} ->
 	    {noreply, S1};
 	{Error, S1} ->
@@ -358,7 +279,7 @@ handle_info({'DOWN',Ref,process,_Pid,_Reason},S) ->
     S1 = remove_subscription(Ref,S),
     {noreply, S1};
 handle_info(_Info, S) ->
-    debug("handle_info: ~p", [_Info]),
+    ?debug("handle_info: ~p", [_Info]),
     {noreply, S}.
 
 %%--------------------------------------------------------------------
@@ -392,14 +313,14 @@ code_change(_OldVsn, S, _Extra) ->
 
 send_command_(Command, S) ->
     CData = exo_json:encode(Command),
-    Reply = uart:send(S#s.uart, CData),
+    Reply = uart:send(S#state.uart, CData),
     {Reply,S}.
 
 send_command_(Command, Data, S) ->
     CData = exo_json:encode(Command),
-    case uart:send(S#s.uart, CData) of
+    case uart:send(S#state.uart, CData) of
 	ok ->
-	    Reply = uart:send(S#s.uart, Data),
+	    Reply = uart:send(S#state.uart, Data),
 	    {Reply,S};
 	Error ->
 	    {Error,S}
@@ -409,9 +330,9 @@ handle_event({struct,[{"in",{array,Input}}]}, S) ->
     handle_input(Input, S);
 handle_event({struct,[{"l", Layout}]}, S) ->
     {L,Is} = decode_layout(Layout,[]),
-    _Ls = format_layout(L),
     S1 = match_layout(L, Is, S),
-    S1#s { layout = L, index_list = Is };
+    emit_unit_and_index(Is),
+    S1#state { layout = L, index_list = Is };
 handle_event(_Event, S) ->
     S.
 
@@ -421,36 +342,36 @@ handle_input([{struct,Input} | Is], S) ->
 handle_input([], S) ->
     S.
 
-handle_inp(Input, S) when S#s.index_list =/= undefined ->
-    debug("input ~p\n", [Input]),
+handle_inp(Input, S) when S#state.index_list =/= undefined ->
+    ?debug("input ~p\n", [Input]),
     case Input of
 	[{"i",Index},{"v",{array,[Press,Backward,Forward,Value,
 				  _R1,_R2,_R3,_R4]}}] ->
-	    case lists:keyfind(Index,#index.i,S#s.index_list) of
+	    case lists:keyfind(Index,#index.i,S#state.index_list) of
 		false ->
 		    io:format("device index=~w not found\n", [Index]),
 		    S;
-		#index{t=?TYPE_SLIDER,u=Unique} ->
-		    send_event(S#s.subs,
+		#index{t=slider,u=Unique} ->
+		    send_event(S#state.subs,
 			       [{type,slider},
 				{index,Index},
 				{id,Unique},
 				{value,Press}]),
 		    S;
-		#index{t=?TYPE_BUTTON,u=Unique} ->
-		    send_event(S#s.subs,
+		#index{t=button,u=Unique} ->
+		    send_event(S#state.subs,
 			       [{type,button},
 				{index,Index},
 				{id,Unique},
 				{state,Press}
 			       ]),
 		    S;
-		#index{t=?TYPE_DIAL,u=Unique} ->
+		#index{t=dial,u=Unique} ->
 		    Dir = if Forward =:= 1 -> 1;
 			     Backward =:= 1 -> -1;
 			     true -> none
 			  end,
-		    send_event(S#s.subs,
+		    send_event(S#state.subs,
 			       [{type,dial},
 				{index,Index},
 				{id,Unique},
@@ -469,11 +390,11 @@ handle_inp(_Input, S) ->
 
 send_event([#subscription{pid=Pid,mon=Ref,pattern=Pattern}|Tail], Event) ->
     case match_event(Pattern, Event) of
-	true -> 
-	    io:format("Send event ~p\n", [Event]),
+	true ->
+	    ?debug("Send event ~p", [Event]),
 	    Pid ! {egear_event,Ref,Event};
-	false -> 
-	    io:format("Ignore event ~p\n", [Event]),
+	false ->
+	    ?debug("Ignore event ~p", [Event]),
 	    false
     end,
     send_event(Tail,Event);
@@ -487,14 +408,20 @@ match_event([{Key,ValuePat}|Kvs],Event) ->
 	_ -> false
     end.
 
+%% emit unit/index mapping when device is attached
+emit_unit_and_index([#index{i=I,u=U,t=T}|Is]) ->
+    io:format("index:~w, unit=~s, type=~s\n", [I,U,T]),
+    emit_unit_and_index(Is);
+emit_unit_and_index([]) ->
+    ok.
 
 match_layout(_Layout,Is,S) ->
     match_index_list(Is, S).
 
 match_index_list([#index{i=I,u=U}|Is], S) ->
-    case lists:keyfind(U, 1, S#s.config) of
+    case lists:keyfind(U, 1, S#state.config) of
 	{U,color,RGB} ->
-	    Command = set_leds_command_([{I,0,RGB}]),
+	    Command = make_leds_command([{I,0,RGB}]),
 	    {_Reply,S1} = send_command_(Command,S),
 	    match_index_list(Is, S1);
 	_ ->
@@ -508,10 +435,17 @@ decode_layout({struct,[{"u",Unique},
 		       {"t",Type},
 		       {"c",{array,As}}]}, Conf) ->
     {Array,Conf1} = decode_layout_(As,[],Conf),
-    { #layout { u = Unique,
+    U = string:trim(Unique),
+    T = case Type of
+	    ?TYPE_SCREEN -> screen;
+	    ?TYPE_BUTTON -> button;
+	    ?TYPE_DIAL   -> dial;
+	    ?TYPE_SLIDER -> slider
+	end,
+    { #layout { u = U,
 		i = Index,
-		t = Type,
-		c = Array }, [#index{i=Index,t=Type,u=Unique}|Conf1]}.
+		t = T,
+		c = Array }, [#index{i=Index,t=T,u=U}|Conf1]}.
 
 decode_layout_([null | As], Acc, Conf) ->
     decode_layout_(As, [null|Acc], Conf);
@@ -521,94 +455,29 @@ decode_layout_([A | As], Acc, Conf) ->
 decode_layout_([], Acc, Conf) ->
     {lists:reverse(Acc), Conf}.
 
-%% format layout put the components on the grid.
-%% return a list [{X,Y,Type,Index}]
-multiply({A11,A12,A21,A22},{B11,B12,B21,B22}) ->
-    { A11*B11 + A12*B21, A11*B12 + A12*B22,
-      A21*B11 + A22*B21, A21*B12 + A22*B22 }.
-
-rotate_90(A) -> multiply(A,{0,-1,1,0}).    %% left,ccw
-rotate_270(A)  -> multiply(A,{0,1,-1,0}).  %% right,cw
-rotate_180(A) -> multiply(A,{-1,0,0,-1}).  %% half turn
-move({A11,A12,A21,A22},{Dx,Dy},{X,Y}) -> {Dx*A11+Dy*A12+X,Dx*A21+Dy*A22+Y}.
--define(ID, {1,0,0,1}).
-
-format_layout(L) ->
-    lists:sort(format_item(L, {0,0}, ?ID, [])).
-
-format_item(null, _Pos, _Mx, Acc) ->
-    Acc;
-format_item(#layout{t=T,i=I,c=Items}, Pos={X,Y}, Mx, Acc) ->
-    format_layout(T,Items,Pos,Mx,[{Y,X,T,I} | Acc]).
-    
-format_layout(Type, [R,D,L], Pos, Mx, Acc) when
-      Type =:= ?TYPE_SCREEN; Type =:= ?TYPE_BUTTON; Type =:= ?TYPE_DIAL ->
-    Acc1 = format_item(R, move(Mx,{1,0},Pos), rotate_270(Mx), Acc),
-    Acc2 = format_item(D, move(Mx,{0,1},Pos), Mx, Acc1),
-    Acc3 = format_item(L, move(Mx,{-1,0},Pos),rotate_90(Mx), Acc2),
-    Acc3;
-format_layout(Type,[UR,R,DR,DL,L],Pos,Mx,Acc=[{_,_,T,I}|_]) when
-      Type =:= ?TYPE_SLIDER ->
-    {X1,Y1} = move(Mx,{1,0},Pos),
-    Acc0 = [{Y1,X1,T,I}|Acc],
-    Acc1 = format_item(UR, move(Mx,{1,-1},Pos), rotate_180(Mx), Acc0),
-    Acc2 = format_item(R,  move(Mx,{2,0},Pos), rotate_270(Mx), Acc1),
-    Acc3 = format_item(DR, move(Mx,{1,1},Pos), Mx,Acc2),
-    Acc4 = format_item(DL, move(Mx,{0,1},Pos), Mx, Acc3),
-    Acc5 = format_item(L, move(Mx,{-1,0},Pos), rotate_90(Mx), Acc4),
-    Acc5.
-
-
-%% SCREEN
-%% +-------+
-%% |       |
-%% |  Gear |
-%% |       |
-%% +-------+
-%% +-------+
-%% |  ---  |
-%% | |   | |
-%% |  ---  |
-%% +-------+
-%% +-------+
-%% |  ===  |
-%% | |XXX| |
-%% |  ===  |
-%% +-------+
-%% +-------+
-%% |   |   |
-%% |   |   |
-%% |  ===  |
-%% |   |   |
-%% |   |   |
-%% |   |   |
-%% +-------+
-%% +---------------+
-%% |               |
-%% | ---||-------  |
-%% |               |
-%% +---------------+
-%%
-render_layout(_Ls) ->
-    "".
-
-remove_subscription(Ref, S=#s { subs=Subs}) ->
+remove_subscription(Ref, S=#state { subs=Subs}) ->
     Subs1 = lists:keydelete(Ref, #subscription.mon, Subs),
-    S#s { subs = Subs1 }.
+    S#state { subs = Subs1 }.
 
-
-open(S0=#s { device = DeviceName, baud_rate = Baud }) ->
+open(S0=#state { device = DeviceName, baud_rate = Baud }) ->
     UartOpts = [{baud, Baud}, {packet, line},
 		{csize, 8}, {stopb,1}, {parity,none}, {active, true}],
     case uart:open1(DeviceName, UartOpts) of
 	{ok,U} ->
-	    debug("~s@~w", [DeviceName,Baud]),
-	    send_command_({struct,[{start,1}]}, S0#s{uart=U});
+	    ?debug("~s@~w", [DeviceName,Baud]),
+	    {R1,S1} = send_command_({struct,[{start,1}]}, S0#state{uart=U}),
+	    %% Scr = S1#state.screen,
+	    %% if Scr >= 0, Scr =< 15 ->
+	    %% send_command_({struct,[{screen_display,Scr}]},S1);
+	    %% true ->
+	    {R1,S1};
+	    %% end;
 
 	{error,E} when E =:= eaccess; E =:= enoent; E =:= ebusy ->
-	    if is_integer(S0#s.retry_interval), S0#s.retry_interval > 0 ->
-		    debug("~s@~w  error ~w, will try again in ~p msecs.", 
-			  [DeviceName,Baud,E,S0#s.retry_interval]),
+	    if is_integer(S0#state.retry_interval), 
+	       S0#state.retry_interval > 0 ->
+		    ?debug("~s@~w  error ~w, will try again in ~p msecs.", 
+			   [DeviceName,Baud,E,S0#state.retry_interval]),
 		    {ok, reopen(S0)};
 	       true ->
 		    {E, S0}
@@ -617,18 +486,18 @@ open(S0=#s { device = DeviceName, baud_rate = Baud }) ->
 	    {E, S0}
     end.
 
-reopen(S=#s {device = DeviceName}) ->
-    if S#s.uart =/= undefined ->
-	    debug("closing device ~s", [DeviceName]),
-	    R = uart:close(S#s.uart),
-	    debug("closed ~p", [R]),
+reopen(S=#state {device = _DeviceName}) ->
+    if S#state.uart =/= undefined ->
+	    ?debug("closing device ~s", [_DeviceName]),
+	    R = uart:close(S#state.uart),
+	    ?debug("closed ~p", [R]),
 	    R;
        true ->
 	    ok
     end,
-    T = erlang:max(100, S#s.retry_interval),
+    T = erlang:max(100, S#state.retry_interval),
     Timer = start_timer(T, reopen),
-    S#s { uart=undefined, retry_timer=Timer }.
+    S#state { uart=undefined, retry_timer=Timer }.
 
 start_timer(undefined, _Tag) ->
     undefined;
@@ -637,143 +506,9 @@ start_timer(infinity, _Tag) ->
 start_timer(Time, Tag) ->
     erlang:start_timer(Time,self(),Tag).
 
-debug(Fmt, Args) ->
-    io:format(Fmt++"\n", Args).
-
-erlang() ->
-    xpm([{$\s,0,{255,255,255}},
-	 {$.,1,{16#8c,16#00,16#2f}},
-	 {$+,2,{16#00,16#00,16#00}}],
-[
- "                                                                                                                                ",
- " .................                                                                                             ................ ",
- " ................                                                                                               ............... ",
- " ...............                                           ...........                                           .............. ",
- " ..............                                          ................                                        .............. ",
- " ..............                                        ....................                                       ............. ",
- " .............                                        ......................                                      ............. ",
- " ............                                        ........................                                      ............ ",
- " ............                                       ..........................                                     ............ ",
- " ...........                                       ...........................                                      ........... ",
- " ...........                                      .............................                                     ........... ",
- " ..........                                       ..............................                                     .......... ",
- " ..........                                      ...............................                                     .......... ",
- " .........                                       ...............................                                     .......... ",
- " .........                                      ................................                                      ......... ",
- " .........                                      .................................                                     ......... ",
- " ........                                       .................................                                     ......... ",
- " ........                                      ..................................                                     ......... ",
- " .......                                       ..................................                                      ........ ",
- " .......                                                                                                               ........ ",
- " .......                                                                                                               ........ ",
- " ......                                                                                                                ........ ",
- " ......                                                                                                                ........ ",
- " ......                                                                                                                 ....... ",
- " ......                                                                                                                 ....... ",
- " ......                                                                                                                 ....... ",
- " .....                                                                                                                  ....... ",
- " .....                                                                                                                  ....... ",
- " .....                                                                                                                  ....... ",
- " .....                                                                                                                  ....... ",
- " .....                                                                                                                  ....... ",
- " ....                                                                                                                   ....... ",
- " ....                                                                                                                   ....... ",
- " ....                                                                                                                   ....... ",
- " ....                                                                                                                   ....... ",
- " ....                                                                                                                   ....... ",
- " ....                                                                                                                   ....... ",
- " ....                                                                                                                   ....... ",
- " ....                                         ................................................................................. ",
- " ....                                         ................................................................................. ",
- " ....                                         ................................................................................. ",
- " ....                                         ................................................................................. ",
- " ....                                         ................................................................................. ",
- " ....                                         ................................................................................. ",
- " ....                                          ................................................................................ ",
- " ....                                          ................................................................................ ",
- " ....                                          ................................................................................ ",
- " .....                                         ................................................................................ ",
- " .....                                         ................................................................................ ",
- " .....                                         ................................................................................ ",
- " .....                                         ................................................................................ ",
- " .....                                         ................................................................................ ",
- " .....                                          ............................................................................... ",
- " ......                                         ............................................................................... ",
- " ......                                         ............................................................................... ",
- " ......                                         ............................................................................... ",
- " ......                                          ......................................................  ...................... ",
- " .......                                         ......................................................    .................... ",
- " .......                                         .....................................................       .................. ",
- " .......                                          ....................................................         ................ ",
- " .......                                          ...................................................            .............. ",
- " ........                                         ..................................................               ............ ",
- " ........                                          ................................................                  .......... ",
- " .........                                         ...............................................                     ........ ",
- " .........                                          ..............................................                       ...... ",
- " .........                                           ............................................                          .... ",
- " ..........                                          ...........................................                          ..... ",
- " ..........                                           .........................................                           ..... ",
- " ...........                                           .......................................                           ...... ",
- " ...........                                            .....................................                           ....... ",
- " ............                                            ..................................                             ....... ",
- " ............                                             ................................                             ........ ",
- " .............                                             .............................                              ......... ",
- " ..............                                              ..........................                               ......... ",
- " ..............                                               .......................                                .......... ",
- " ...............                                                 .................                                  ........... ",
- " ................                                                    .........                                     ............ ",
- " ................                                                                                                  ............ ",
- " .................                                                                                                ............. ",
- " ..................                                                                                              .............. ",
- " ...................                                                                                            ............... ",
- "                                                                                                                                ",
- "                                                                                                                                ",
- "                                                                                                                                ",
- "                                                                                                                                ",
- "                                                                                                                                ",
- "                                                                                                                                ",
- "                                                                                                                   +++++        ",
- " ++++++++++          +++++++++            ++++                    ++++              ++++         +++++           ++++++++++     ",
- " ++++++++++          ++++++++++           ++++                   +++++              ++++         +++++          ++++++++++++    ",
- " ++++++++++          +++++++++++          ++++                   ++++++             +++++        +++++         ++++++++++++++   ",
- " ++++                ++++   ++++          ++++                   ++++++             ++++++       +++++        +++++      +++++  ",
- " ++++                ++++   +++++         ++++                  +++++++             +++++++      +++++       +++++        +++   ",
- " ++++                ++++    ++++         ++++                  ++++++++            ++++++++     +++++       ++++         +     ",
- " ++++                ++++    ++++         ++++                 ++++ ++++            ++++++++     +++++      +++++               ",
- " ++++                ++++   ++++          ++++                 ++++ ++++            ++++ ++++    +++++      ++++                ",
- " ++++++++++          ++++  +++++          ++++                 +++   ++++           ++++  ++++   +++++      ++++                ",
- " ++++++++++          ++++++++++           ++++                ++++   ++++           ++++   ++++  +++++      ++++      +++++++++ ",
- " ++++++++++          ++++++++++           ++++                ++++   +++++          ++++   ++++  +++++      ++++      +++++++++ ",
- " ++++                ++++++++             ++++                ++++    ++++          ++++    ++++ +++++      ++++      +++++++++ ",
- " ++++                +++++++++            ++++               +++++++++++++          ++++     +++++++++      +++++         ++++  ",
- " ++++                ++++ ++++            ++++               ++++++++++++++         ++++      ++++++++       ++++         ++++  ",
- " ++++                ++++ +++++           ++++              +++++++++++++++         ++++       +++++++       +++++        ++++  ",
- " ++++                ++++  +++++          ++++              +++++      ++++         ++++       +++++++        +++++      +++++  ",
- " ++++++++++          ++++  +++++          ++++++++++        ++++        ++++        ++++        ++++++        ++++++   ++++++   ",
- " ++++++++++          ++++   +++++         ++++++++++       ++++         ++++        ++++         +++++         +++++++++++++    ",
- " ++++++++++          ++++    +++++        ++++++++++       ++++         +++++       ++++          ++++          +++++++++++     ",
- " ++++++++++          ++++    +++++        +++++++++        +++           ++++        +++           ++             ++++++++      ",
- "                                                                                                                                "	
- ]).
-
-xpm(XPMPalette,XPM) ->
-    Palette = palette([Color||{_Char,_Index,Color} <- XPMPalette]),
-    Data = xpm_rows(XPMPalette,XPM,128,[]),
-    Pixmap = << <<I:4>> || I <- Data>>,
-    <<Palette/binary, Pixmap/binary>>.
-
-xpm_rows(_Palette, _, 0, Data) -> 
-    lists:append(Data);
-xpm_rows(Palette, [R|Rs], I, Data) ->
-    D = xpm_row(Palette, R, 128, []),
-    xpm_rows(Palette, Rs, I-1, [D|Data]);
-xpm_rows(Palette, [], I, Data) ->
-    xpm_rows(Palette, [], I-1, [lists:duplicate(128,0)|Data]).
-
-xpm_row(_Palette,_Cs,0,Data) ->
-    lists:reverse(Data);
-xpm_row(Palette,[C|Cs],J,Data) ->
-    {_,I,_Color} = lists:keyfind(C,1,Palette),
-    xpm_row(Palette,Cs,J-1,[I|Data]);
-xpm_row(Palette,[],J,Data) ->
-    xpm_row(Palette,[],J-1,[0|Data]).
+-spec make_leds_command(Leds::[{index(),integer(),color()}]) ->
+			       json().
+make_leds_command(Ls = [{_I,_M,_RGB}|_Leds]) ->
+    {struct,[{led,{array,
+		   [{struct,[{b,B},{g,G},{i,I},{m,M},{r,R}]} ||
+		       {I,M,{R,G,B}} <- Ls]}}]}.
