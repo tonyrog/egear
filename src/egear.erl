@@ -23,20 +23,35 @@
 -export([set_leds/1]).
 -export([set_led/2]).
 -export([set_led/3]).
--export([send_version/0]).
+-export([get_layout/0]).
+-export([get_list/0]).
+-export([get_core_version/0]).
+-export([get_screen_version/0]).
+
+-export([i/0]).
 -export([enable/0, disable/0]).
 -export([json_command/1]).
--export([get_layout/0]).
 -export([abs_layout/0]).
 -export([show_layout/0]).
 
 -include("egear.hrl").
+
+%% -define(debug(Fmt,Args), io:format((Fmt)++"\n", (Args))).
+-define(debug(Fmt,Args), ok).
 
 start() ->
     application:ensure_all_started(egear).
 
 stop() ->
     application:stop(egear).
+
+i() ->
+    io:format("~8s ~8s ~8s ~8s\n", ["Index","Type","ID","Value"]),
+    {ok,List} = get_list(),
+    lists:foreach(
+      fun({I,T,U,V}) ->
+	      io:format("~8w ~8s ~8s ~w\n", [I,T,U,V])
+      end, List).
 
 -spec subscribe(Pattern::[{atom(),string()}]) ->
 		       {ok,reference()} | {error, Error::term()}.
@@ -59,9 +74,22 @@ enable() ->
 disable() ->
     json_command({struct,[{stop,1}]}).
 
--spec send_version() -> ok | {error,Reason::atom()}.
-send_version() ->
-    json_command({struct,[{send_version,1}]}).
+-spec get_core_version() -> {ok,Version::string()} | {error,Reason::atom()}.
+get_core_version() ->
+    egear_server:get_info(?SERVER, core_version).
+
+-spec get_screen_version() -> {ok,Version::string()} | {error,Reason::atom()}.
+get_screen_version() ->
+    egear_server:get_info(?SERVER, screen_version).
+
+-spec get_layout() -> {ok,Layout::#layout{}} | {error,Reason::atom()}.
+get_layout() ->
+    egear_server:get_info(?SERVER, layout).
+
+-spec get_list() -> {ok,[{Index::integer(),Type::item_type(),ID::string()}]} |
+		    {error,Reason::atom()}.
+get_list() ->
+    egear_server:get_info(?SERVER, list).
 
 %% set/show screen number Num
 -spec screen_display(Num::0..15) -> ok | {error,Reason::atom()}.
@@ -91,10 +119,13 @@ set_leds(Ls) ->
 set_led(I,RGB) ->
     set_leds([{I,0,RGB}]).
 
--spec set_led(I::index(),M::integer(),Color::color()) ->
-		      ok | {error,Reason::atom()}.
-set_led(I,M,RGB) ->
-    set_leds([{I,M,RGB}]).
+%% set led mode and color
+%% m=0 set constant color
+%% m=1 color intensity is controlled by the slider/dial/button
+-spec set_led(I::index(),Mode::integer(),Color::color()) ->
+		     ok | {error,Reason::atom()}.
+set_led(I,Mode,RGB) ->
+    set_leds([{I,Mode,RGB}]).
 
 -spec set_hidmap(Map::term()) -> ok | {error,Reason::atom()}.
     
@@ -126,11 +157,6 @@ json_command(Command) ->
 			  ok | {error,Reason::atom()}.
 json_command(Command,Data) ->
     egear_server:json_command(?SERVER, Command,Data).
-
--spec get_layout() -> {ok,Layout::#layout{}} | {error,Reason::atom()}.
-
-get_layout() ->
-    egear_server:get_layout(?SERVER).
 
 -define(ID, {1,0,0,1}).
 
@@ -171,8 +197,8 @@ abs_layout_(Type,[UR,R,DR,DL,L],Pos,Mx,[A|Acc])
     {X1,Y1} = move(Mx,{1,0},Pos),
     Orientation = if A#abspos.y =:= Y1, A#abspos.x < X1 -> right;
 		     A#abspos.y =:= Y1, A#abspos.x > X1 -> left;
-		     A#abspos.x =:= X1, A#abspos.y < Y1 -> up;
-		     A#abspos.x =:= X1, A#abspos.y > Y1 -> down
+		     A#abspos.x =:= X1, A#abspos.y < Y1 -> down;
+		     A#abspos.x =:= X1, A#abspos.y > Y1 -> up
 		  end,
     Acc0 = [A#abspos{orientation=Orientation}|Acc],
     Acc1 = abs_item_(UR, move(Mx,{1,-1},Pos), rotate_180(Mx), Acc0),
@@ -194,21 +220,40 @@ rotate_180(A) -> multiply(A,{-1,0,0,-1}).  %% half turn
 move({A11,A12,A21,A22},{Dx,Dy},{X,Y}) -> {Dx*A11+Dy*A12+X,Dx*A21+Dy*A22+Y}.
 
 render_layout(Ls0) ->
-    Xs0 = [X || #abspos{x=X} <- Ls0],
-    Ys0 = [Y || #abspos{y=Y} <- Ls0],
-    MinX = lists:min(Xs0),
-    MaxX = lists:max(Xs0),
-    MinY = lists:min(Ys0),
-    MaxY = lists:max(Ys0),
+    MinX = lists:min([x_min(E)||E<-Ls0]),
+    MaxX = lists:max([x_max(E)||E<-Ls0]),
+    MinY = lists:min([y_min(E)||E<-Ls0]),
+    MaxY = lists:max([y_max(E)||E<-Ls0]),
     SizeX = (MaxX - MinX)+1,
     SizeY = (MaxY - MinY)+1,
+    ?debug("min-x=~w,max-x=~w,min-y=~w,max-y=~w\n", 
+	   [MinX,MaxX,MinY,MaxY]),
+    ?debug("size-x=~w, size-y=~w\n", [SizeX,SizeY]),
     %% offset all points and with 0,0 as top left corner
     %% make all coordinate positive, then tilt Y axis
     Ls = [A#abspos{y=(A#abspos.y-MinY),x=(A#abspos.x-MinX)} || A <- Ls0],
-    Blank = array:new(SizeX*9,[{default,$\s}]),
-    Screen = array:new(SizeY*5,[{default,Blank}]),
+    ?debug("offset abs-positions = ~p\n", [Ls]),
+    W = SizeX*9,
+    H = SizeY*5,
+    ?debug("screen size = ~wx~w\n", [W,H]),
+    Blank = array:new(W,[{default,$\s}]),
+    Screen = array:new(H,[{default,Blank}]),
     Screen1 = render_items(Ls, Screen),
     [[array:to_list(R),"\n"] || R <- array:to_list(Screen1)].
+
+%% get min/max x/y positions
+x_min(#abspos{type=slider,orientation=left,x=X}) -> X-1;
+x_min(#abspos{x=X}) -> X.
+
+x_max(#abspos{type=slider,orientation=right,x=X}) -> X+1;
+x_max(#abspos{x=X}) -> X.
+
+y_min(#abspos{type=slider,orientation=up,y=Y}) -> Y-1;
+y_min(#abspos{y=Y}) -> Y.
+
+y_max(#abspos{type=slider,orientation=down,y=Y}) -> Y+1;
+y_max(#abspos{y=Y}) -> Y.
+    
 
 render_items([#abspos{y=Y,x=X,type=T,orientation=R}|L],Screen) ->
     case T of
@@ -237,16 +282,16 @@ render_button(X,Y,_VH,Screen) ->
     draw_lines(X,Y,Screen,
 	       ["+-------+",
 		"|  ---  |",
-		"| |   | |",
+		"| | O | |",
 		"|  ---  |",
 		"+-------+"]).
 
 render_dial(X,Y,_VH,Screen) ->
     draw_lines(X,Y,Screen,
 	       ["+-------+",
-		"|  ===  |",
-		"| |XXX| |",
-		"|  ===  |",
+		"|  ---  |",
+		"| |   | |",
+		"|  ---  |",
 		"+-------+"]).
 
 render_slider(X,Y,down,Screen) ->
@@ -263,7 +308,7 @@ render_slider(X,Y,down,Screen) ->
 		"|   |   |",
 		"+-------+"]);
 render_slider(X,Y,up,Screen) ->
-    draw_lines(X,Y-9,Screen,
+    draw_lines(X,Y-5,Screen,
 	       [
 		"+-------+",
 		"|   |   |",
@@ -283,7 +328,7 @@ render_slider(X,Y,right,Screen) ->
 		"|                |",
 		"+----------------+"]);
 render_slider(X,Y,left,Screen) ->
-    draw_lines(X-5,Y,Screen,
+    draw_lines(X-9,Y,Screen,
 	       ["+----------------+",
 		"|                |",
 		"| ---||--------- |",
@@ -296,11 +341,11 @@ draw_lines(_X,_Y,Screen,[]) ->
     Screen.
 
 draw_line(X,Y,Screen,L) ->
-    io:format("draw line x=~w,y=~w [~s]\n", [X,Y,L]),
+    %% ?debug("draw line x=~w,y=~w [~s]\n", [X,Y,L]),
     A0 = array:get(Y,Screen),
     A1 = lists:foldl(
 	   fun({Xi,Char},Ai) ->
-		   io:format("draw char x=~w [~s]\n", [Xi,[Char]]),
+		   %% ?debug("draw char x=~w [~s]\n", [Xi,[Char]]),
 		   array:set(Xi,Char,Ai)
 	   end, A0, lists:zip(lists:seq(X,X+length(L)-1), L)),
     array:set(Y,A1,Screen).

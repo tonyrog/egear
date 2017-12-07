@@ -17,9 +17,9 @@
 
 -export([subscribe/1,subscribe/2]).
 -export([unsubscribe/2]).
+-export([get_info/2]).
 
 -export([make_leds_command/1]).
--export([get_layout/1]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -46,9 +46,10 @@
 
 -record(index,
 	{
-	  i :: integer(),
-	  t :: item_type(),
-	  u :: string()
+	  i :: integer(),     %% index
+	  t :: item_type(),   %% type
+	  u :: string(),      %% unique id
+	  v :: term()         %% current value
 	}).
 %%
 %% Relative screen_orientaion = 2!
@@ -65,11 +66,13 @@
 	  baud_rate = 115200 :: integer(),
 	  retry_interval = 5000 :: integer(),
 	  retry_timer :: reference(),
-	  layout :: #layout{},
-	  index_list :: [#index{}],
+	  layout = null :: null | #layout{},
+	  index_list = [] :: [#index{}],
+	  version_core = "" :: string(),
+	  version_screen = "" :: string(),
 	  config :: [{Unique::string(),color,color()}],
 	  screen = undefined, %% screen to set at startup
-	  subs = []
+	  subs = [] :: [#subscription{}]
 	}).
 
 %%%===================================================================
@@ -125,10 +128,10 @@ json_command(Pid,Command) ->
 json_command(Pid,Command,Data) ->
     gen_server:call(Pid,{command, Command, Data}).
 
--spec get_layout(Pid::pid()) -> {ok,Layout::#layout{}}.
+-spec get_info(Pid::pid(),Item::atom()) -> {ok,Layout::#layout{}}.
 
-get_layout(Pid) ->
-    gen_server:call(Pid,get_layout).
+get_info(Pid,Item) ->
+    gen_server:call(Pid,{info,Item}).
 %%%===================================================================
 %%% gen_server callbacks
 %%%===================================================================
@@ -169,7 +172,7 @@ init(Options) ->
 		 {ok,M} ->
 		     [{string:trim(U),K,V}||{U,K,V}<-M]
 	     end,
-    Screen = case application:get_env(egeat, screen) of
+    Screen = case application:get_env(egear, screen) of
 		 undefined -> undefined;
 		 {ok,Scr} -> Scr
 	     end,
@@ -212,8 +215,17 @@ handle_call({unsubscribe,Ref},_From,S) ->
     erlang:demonitor(Ref),
     S1 = remove_subscription(Ref,S),
     {reply, ok, S1};
-handle_call(get_layout,_From,S) ->
-    {reply, {ok,S#state.layout}, S};
+handle_call({info,Item},_From,S) ->
+    Result = case Item of
+		 layout -> S#state.layout;
+		 list   ->
+		     L = lists:keysort(#index.i, S#state.index_list),
+		     [{I,T,U,V}|| #index{i=I,t=T,u=U,v=V} <-L];
+		 core_version -> S#state.version_core;
+		 screen_version -> S#state.version_screen;
+		 _ -> undefined
+	     end,
+    {reply, {ok,Result}, S};
 handle_call(stop, _From, S) ->
     uart:close(S#state.uart),
     {stop, normal, ok, S#state { uart=undefined }};
@@ -256,15 +268,17 @@ handle_info({uart,U,Data}, S) when U =:= S#state.uart ->
 handle_info({uart_error,U,Reason}, S) when S#state.uart =:= U ->
     if Reason =:= enxio ->
 	    ?debug("maybe unplugged?", []),
-	    {noreply, reopen(S)};
+	    S1 = disconnect_event(enxio, S),
+	    {noreply, reopen(S1)};
        true ->
 	    lager:warning("uart error=~p", [Reason]),
 	    {noreply, S}
     end;
 handle_info({uart_closed,U}, S) when U =:= S#state.uart ->
     lager:info("uart_closed: reopen in ~w",[S#state.retry_interval]),
-    S1 = reopen(S),
-    {noreply, S1};
+    S1 = disconnect_event(closed, S),
+    S2 = reopen(S1),
+    {noreply, S2};
 handle_info({timeout,TRef,reopen},S) 
   when TRef =:= S#state.retry_timer ->
     case open(S#state { retry_timer = undefined }) of
@@ -330,10 +344,35 @@ handle_event({struct,[{"in",{array,Input}}]}, S) ->
     handle_input(Input, S);
 handle_event({struct,[{"l", Layout}]}, S) ->
     {L,Is} = decode_layout(Layout,[]),
-    S1 = match_layout(L, Is, S),
-    emit_unit_and_index(Is),
-    S1#state { layout = L, index_list = Is };
+    {Is1,New} = merge_index(Is, S#state.index_list),
+    S1 = match_layout(L, New, S),
+    ?debug("new items = ~p\n", [New]),
+    %% if first items added, screen MUST be one of them so
+    %% set the application icon at that point.
+    S3 = if S#state.index_list =:= [], Is1 =/= [] ->
+		 Command = {struct,[{send_version,1}]},
+		 {_,S2} = send_command_(Command,S1),
+		 S2;
+	    true ->
+		 S1
+	 end,
+    S3#state { layout = L, index_list = Is1 };
+handle_event({struct,[{"version_core",VsnCore},
+		      {"version_screen",VsnScreen}|_]}, S) ->
+    S1 = S#state {  version_core = VsnCore,
+		    version_screen = VsnScreen },
+    ?debug("got version core=~p, screen=~p\n", [VsnCore,VsnScreen]),
+    %% when version is received this is a trigger to set applicatin screen 
+    Screen = S1#state.screen,
+    if is_integer(Screen), Screen >= 0, Screen >= 15 ->
+	    Command = {struct,[{screen_display,Screen}]},
+	    {_,Sx} = send_command_(Command,S1),
+	    Sx;
+       true ->
+	    S1
+    end;
 handle_event(_Event, S) ->
+    ?debug("unhandled event ~p\n", [_Event]),
     S.
 
 handle_input([{struct,Input} | Is], S) ->
@@ -347,30 +386,33 @@ handle_inp(Input, S) when S#state.index_list =/= undefined ->
     case Input of
 	[{"i",Index},{"v",{array,[Press,Backward,Forward,Value,
 				  _R1,_R2,_R3,_R4]}}] ->
-	    case lists:keyfind(Index,#index.i,S#state.index_list) of
+	    case lists:keytake(Index,#index.i,S#state.index_list) of
 		false ->
 		    io:format("device index=~w not found\n", [Index]),
 		    S;
-		#index{t=slider,u=Unique} ->
+		{value,I=#index{t=slider,u=Unique},Is} ->
+		    Is1 = [I#index{v=Press}|Is],
 		    send_event(S#state.subs,
 			       [{type,slider},
 				{index,Index},
 				{id,Unique},
 				{value,Press}]),
-		    S;
-		#index{t=button,u=Unique} ->
+		    S#state{index_list=Is1};
+		{value,I=#index{t=button,u=Unique},Is} ->
+		    Is1 = [I#index{v=Press}|Is],
 		    send_event(S#state.subs,
 			       [{type,button},
 				{index,Index},
 				{id,Unique},
 				{state,Press}
 			       ]),
-		    S;
-		#index{t=dial,u=Unique} ->
+		    S#state{index_list=Is1};
+		{value,I=#index{t=dial,u=Unique},Is} ->
 		    Dir = if Forward =:= 1 -> 1;
 			     Backward =:= 1 -> -1;
 			     true -> none
 			  end,
+		    Is1 = [I#index{v={Press,Dir,Value}}|Is],
 		    send_event(S#state.subs,
 			       [{type,dial},
 				{index,Index},
@@ -378,11 +420,12 @@ handle_inp(Input, S) when S#state.index_list =/= undefined ->
 				{direction,Dir},
 				{state,Press},
 				{value,Value}]),
-		    S;
+		    S#state{index_list=Is1};
 		_ ->
 		    S
 	    end;
-	_ ->
+	_Inp ->
+	    ?debug("unhandled input ~p\n", [_Inp]),
 	    S
     end;
 handle_inp(_Input, S) ->
@@ -401,6 +444,17 @@ send_event([#subscription{pid=Pid,mon=Ref,pattern=Pattern}|Tail], Event) ->
 send_event([],_Event) ->
     ok.
 
+disconnect_event(Reason, S) ->
+    lists:foreach(
+      fun(#index { i=Index, t=Type, u=Unique}) ->
+	      send_event(S#state.subs,
+			 [{type,Type},
+			  {index,Index},
+			  {id,Unique},
+			  {error,Reason}])
+      end, S#state.index_list),
+    S#state { index_list = [], layout = null }.
+
 match_event([], _) -> true;
 match_event([{Key,ValuePat}|Kvs],Event) ->
     case lists:keyfind(Key, 1, Event) of
@@ -408,12 +462,19 @@ match_event([{Key,ValuePat}|Kvs],Event) ->
 	_ -> false
     end.
 
-%% emit unit/index mapping when device is attached
-emit_unit_and_index([#index{i=I,u=U,t=T}|Is]) ->
-    io:format("index:~w, unit=~s, type=~s\n", [I,U,T]),
-    emit_unit_and_index(Is);
-emit_unit_and_index([]) ->
-    ok.
+merge_index(IndexList,Old) ->
+    merge_index(IndexList,[],[],Old).
+
+merge_index([I|Is],New,Acc,Old) ->
+    case lists:keyfind(I#index.u, #index.u, Old) of
+	false ->
+	    merge_index(Is,[I|New],Acc,Old);
+	J -> %% keep all old values
+	    Index = I#index.i,
+	    merge_index(Is,New,[J#index{i=Index}|Acc],Old)
+    end;
+merge_index([],New,Acc,_Old) ->
+    {Acc++New, New}.
 
 match_layout(_Layout,Is,S) ->
     match_index_list(Is, S).
@@ -465,13 +526,7 @@ open(S0=#state { device = DeviceName, baud_rate = Baud }) ->
     case uart:open1(DeviceName, UartOpts) of
 	{ok,U} ->
 	    ?debug("~s@~w", [DeviceName,Baud]),
-	    {R1,S1} = send_command_({struct,[{start,1}]}, S0#state{uart=U}),
-	    %% Scr = S1#state.screen,
-	    %% if Scr >= 0, Scr =< 15 ->
-	    %% send_command_({struct,[{screen_display,Scr}]},S1);
-	    %% true ->
-	    {R1,S1};
-	    %% end;
+	    send_command_({struct,[{start,1}]}, S0#state{uart=U});
 
 	{error,E} when E =:= eaccess; E =:= enoent; E =:= ebusy ->
 	    if is_integer(S0#state.retry_interval), 
