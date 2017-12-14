@@ -72,6 +72,7 @@
 	  version_screen = "" :: string(),
 	  config :: [{Unique::string(),color,color()}],
 	  screen = undefined, %% screen to set at startup
+	  xbus = false :: boolean(), %% use xbus publish or not
 	  subs = [] :: [#subscription{}]
 	}).
 
@@ -176,11 +177,17 @@ init(Options) ->
 		 undefined -> undefined;
 		 {ok,Scr} -> Scr
 	     end,
+    Xbus = case application:get_env(egear, xbus) of
+	       undefined -> (#state{})#state.xbus;
+	       {ok,true} -> xbus:start(), true;
+	       {ok,false} -> false
+	   end,
     S = #state { device = Device,
 		 retry_interval = RetryInterval,
 		 baud_rate = BaudRate,
 		 config = Config,
-		 screen = Screen
+		 screen = Screen,
+		 xbus = Xbus
 	       },
     case open(S) of
 	{ok, S1} -> {ok, S1};
@@ -344,9 +351,12 @@ handle_event({struct,[{"in",{array,Input}}]}, S) ->
     handle_input(Input, S);
 handle_event({struct,[{"l", Layout}]}, S) ->
     {L,Is} = decode_layout(Layout,[]),
-    {Is1,New} = merge_index(Is, S#state.index_list),
-    S1 = match_layout(L, New, S),
-    ?debug("new items = ~p\n", [New]),
+    {Is1,Added,Deleted} = merge_index(Is, S#state.index_list),
+    S1 = match_layout(L, Added, S),
+    ?debug("removed items = ~p\n", [Deleted]),
+    lists:foreach(fun(I) -> send_connect_event(S,I,enoent) end, Deleted),
+    ?debug("new items = ~p\n", [Added]),
+    lists:foreach(fun(I) -> send_connect_event(S,I,ok) end, Added),
     %% if first items added, screen MUST be one of them so
     %% set the application icon at that point.
     S3 = if S#state.index_list =:= [], Is1 =/= [] ->
@@ -390,37 +400,19 @@ handle_inp(Input, S) when S#state.index_list =/= undefined ->
 		false ->
 		    io:format("device index=~w not found\n", [Index]),
 		    S;
-		{value,I=#index{t=slider,u=Unique},Is} ->
-		    Is1 = [I#index{v=Press}|Is],
-		    send_event(S#state.subs,
-			       [{type,slider},
-				{index,Index},
-				{id,Unique},
-				{value,Press}]),
-		    S#state{index_list=Is1};
-		{value,I=#index{t=button,u=Unique},Is} ->
-		    Is1 = [I#index{v=Press}|Is],
-		    send_event(S#state.subs,
-			       [{type,button},
-				{index,Index},
-				{id,Unique},
-				{state,Press}
-			       ]),
-		    S#state{index_list=Is1};
-		{value,I=#index{t=dial,u=Unique},Is} ->
-		    Dir = if Forward =:= 1 -> 1;
-			     Backward =:= 1 -> -1;
-			     true -> none
+		{value,I=#index{t=slider,u=Unique,v=V0},Is} ->
+		    send_slider_event(S, Index, Unique, Press, V0),
+		    S#state{index_list=[I#index{v=Press}|Is]};
+		{value,I=#index{t=button,u=Unique,v=V0},Is} ->
+		    send_button_event(S, Index, Unique, Press, V0),
+		    S#state{index_list=[I#index{v=Press}|Is]};
+		{value,I=#index{t=dial,u=Unique,v=V0},Is} ->
+		    Dir = if Forward  > 0 -> Forward;
+			     Backward > 0 -> -Backward;
+			     true -> 0
 			  end,
-		    Is1 = [I#index{v={Press,Dir,Value}}|Is],
-		    send_event(S#state.subs,
-			       [{type,dial},
-				{index,Index},
-				{id,Unique},
-				{direction,Dir},
-				{state,Press},
-				{value,Value}]),
-		    S#state{index_list=Is1};
+		    send_dial_event(S, Index, Unique, Dir, Press, Value, V0),
+		    S#state{index_list=[I#index{v={Press,Dir,Value}}|Is]};
 		_ ->
 		    S
 	    end;
@@ -430,6 +422,110 @@ handle_inp(Input, S) when S#state.index_list =/= undefined ->
     end;
 handle_inp(_Input, S) ->
     S.
+
+
+%%
+%% xbus slider topic:
+%%    egear.slider.<uniq>.<index>.value
+%% value: Value (0|255)
+%%
+send_slider_event(S, Index, Unique, Value, _V0) ->
+    if S#state.xbus -> %% send to xbus
+	    Path = ["egear.slider",Unique,integer_to_list(Index),"value"],
+	    Topic = string:join(Path,"."),
+	    xbus:pub(Topic, Value);
+       true -> ok
+    end,
+    if S#state.subs =/= [] ->
+	    Props = [{type,slider},{index,Index},{id,Unique},{value,Value}],
+	    send_event(S#state.subs,Props);
+       true -> ok
+    end.
+%%
+%% xbus slider topic:
+%%     egear.button.<uniq>.<index>.state
+%% value: State (0|1)
+%%
+send_button_event(S, Index, Unique, State, _V0) ->
+    if S#state.xbus -> %% send to xbus
+	    Path = ["egear.button",Unique,integer_to_list(Index),"state"],
+	    Topic = string:join(Path,"."),
+	    xbus:pub(Topic, State);
+       true -> ok
+    end,
+    if S#state.subs =/= [] ->
+	    Props = [{type,button},{index,Index},{id,Unique},{state,State}],
+	    send_event(S#state.subs, Props);
+       true -> ok
+    end.
+%%
+%% xbus dial topic:
+%%     egear.dial.<uniq>.<index>.state
+%%     egear.dial.<uniq>.<index>.value
+%%     egear.dial.<uniq>.<index>.dir
+%% 
+%% State = (0|1)
+%% Dir   = -CounterClockWiseSteps|ClockWiseSteps
+%% Value = 0..255
+%%
+send_dial_event(S, Index, Unique, Dir, State, Value, V0) ->
+    if S#state.xbus -> %% send to xbus
+	    T = xbus:timestamp(),
+	    {State0,_Dir0,Value0} = 
+		case V0 of
+		    undefined -> {undefined,undefined,undefined};
+		    _ -> V0
+		end,
+	    Path0 = ["egear.dial",Unique,integer_to_list(Index)],
+	    if State =/= State0 ->
+		    xbus:pub(string:join(Path0++[".state"],"."), State, T);
+	       true -> ok
+	    end,
+	    if Value =/= Value0 ->
+		    xbus:pub(string:join(Path0++[".value"],"."), Value, T);
+	       true -> ok
+	    end,
+	    xbus:pub(string:join(Path0++[".dir"],"."), Dir, T);
+       true -> ok
+    end,
+    if S#state.subs =/= [] ->
+	    Props = [{type,dial},{index,Index},{id,Unique},{direction,Dir},
+		     {state,State},{value,Value}],
+	    send_event(S#state.subs, Props);
+       true -> ok
+    end.
+
+%%
+%% Event to send when item is disconnected from the grid
+%% FIXME: when using X bus clear retain for this item
+%%
+
+disconnect_event(Reason, S) ->
+    lists:foreach(
+      fun(I) ->
+	      send_connect_event(S, I, Reason)
+      end, S#state.index_list),
+    S#state { index_list = [], layout = null }.
+
+%%
+%% xbus disconnect topic
+%%   egear.(dial|button|slider).<uniq>.<index>.connect  value=Reason
+%% Reason = ok | string (atom)
+%%
+send_connect_event(S, #index{t=Type, i=Index, u=Unique}, Reason) ->
+    if S#state.xbus ->
+	    Path = ["egear",atom_to_list(Type),Unique,integer_to_list(Index),
+		    "connect"],
+	    Topic = string:join(Path,"."),
+	    xbus:pub(Topic, atom_to_list(Reason));
+       true -> ok
+    end,
+    if S#state.subs =/= [] ->
+	    Props = [{type,Type},{index,Index},{id,Unique},{connect,Reason}],
+	    send_event(S#state.subs, Props);
+       true ->
+	    ok
+    end.
 
 send_event([#subscription{pid=Pid,mon=Ref,pattern=Pattern}|Tail], Event) ->
     case match_event(Pattern, Event) of
@@ -444,16 +540,6 @@ send_event([#subscription{pid=Pid,mon=Ref,pattern=Pattern}|Tail], Event) ->
 send_event([],_Event) ->
     ok.
 
-disconnect_event(Reason, S) ->
-    lists:foreach(
-      fun(#index { i=Index, t=Type, u=Unique}) ->
-	      send_event(S#state.subs,
-			 [{type,Type},
-			  {index,Index},
-			  {id,Unique},
-			  {error,Reason}])
-      end, S#state.index_list),
-    S#state { index_list = [], layout = null }.
 
 match_event([], _) -> true;
 match_event([{Key,ValuePat}|Kvs],Event) ->
@@ -466,15 +552,15 @@ merge_index(IndexList,Old) ->
     merge_index(IndexList,[],[],Old).
 
 merge_index([I|Is],New,Acc,Old) ->
-    case lists:keyfind(I#index.u, #index.u, Old) of
+    case lists:keytake(I#index.u, #index.u, Old) of
 	false ->
 	    merge_index(Is,[I|New],Acc,Old);
-	J -> %% keep all old values
+	{value,J,Old1} ->
 	    Index = I#index.i,
-	    merge_index(Is,New,[J#index{i=Index}|Acc],Old)
+	    merge_index(Is,New,[J#index{i=Index}|Acc],Old1)
     end;
-merge_index([],New,Acc,_Old) ->
-    {Acc++New, New}.
+merge_index([],New,Acc,Old) ->
+    {Acc++New, New, Old}.
 
 match_layout(_Layout,Is,S) ->
     match_index_list(Is, S).
