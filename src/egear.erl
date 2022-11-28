@@ -60,7 +60,7 @@ subscribe(Pattern) ->
 
 -spec subscribe() -> {ok,reference()} | {error, Error::term()}.
 subscribe() ->
-    egar_server:subscribe(?SERVER).
+    egear_server:subscribe(?SERVER).
 
 -spec unsubscribe(Ref::reference()) -> ok | {error, Error::term()}.
 unsubscribe(Ref) ->

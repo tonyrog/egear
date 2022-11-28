@@ -35,6 +35,8 @@
 
 %% -define(debug(Fmt,Args), io:format((Fmt)++"\n", (Args))).
 -define(debug(Fmt,Args), ok).
+-define(warning(Fmt,Args),  io:format((Fmt)++"\n", (Args))).
+-define(info(Fmt,Args),  io:format((Fmt)++"\n", (Args))).
 
 -record(subscription,
 	{
@@ -149,6 +151,7 @@ get_info(Pid,Item) ->
 %% @end
 %%--------------------------------------------------------------------
 init(Options) ->
+    ?debug("egear:init: options=~p, env=~p\n", [Options, application:get_all_env(egear)]),
     Device = case application:get_env(egear, device) of
 		 undefined ->
 		     proplists:get_value(device, Options);
@@ -182,6 +185,7 @@ init(Options) ->
 	       {ok,true} -> xbus:start(), true;
 	       {ok,false} -> false
 	   end,
+    ?debug("egear:init: xbus = ~p\n", [Xbus]),
     S = #state { device = Device,
 		 retry_interval = RetryInterval,
 		 baud_rate = BaudRate,
@@ -263,7 +267,7 @@ handle_cast(_Msg, S) ->
 %% @end
 %%--------------------------------------------------------------------
 handle_info({uart,U,Data}, S) when U =:= S#state.uart ->
-    try exo_json:decode_string(Data) of
+    try egear_json:decode_string(Data) of
 	{ok,Term} ->
 	    S1 = handle_event(Term, S),
 	    {noreply, S1}
@@ -278,11 +282,11 @@ handle_info({uart_error,U,Reason}, S) when S#state.uart =:= U ->
 	    S1 = disconnect_event(enxio, S),
 	    {noreply, reopen(S1)};
        true ->
-	    lager:warning("uart error=~p", [Reason]),
+	    ?warning("uart error=~p", [Reason]),
 	    {noreply, S}
     end;
 handle_info({uart_closed,U}, S) when U =:= S#state.uart ->
-    lager:info("uart_closed: reopen in ~w",[S#state.retry_interval]),
+    ?info("uart_closed: reopen in ~w",[S#state.retry_interval]),
     S1 = disconnect_event(closed, S),
     S2 = reopen(S1),
     {noreply, S2};
@@ -295,8 +299,8 @@ handle_info({timeout,TRef,reopen},S)
 	    {stop, Error, S1}
     end;
 handle_info({'DOWN',Ref,process,_Pid,_Reason},S) ->
-    lager:debug("handle_info: subscriber ~p terminated: ~p", 
-		[_Pid, _Reason]),
+    ?debug("handle_info: subscriber ~p terminated: ~p", 
+	   [_Pid, _Reason]),
     S1 = remove_subscription(Ref,S),
     {noreply, S1};
 handle_info(_Info, S) ->
@@ -333,12 +337,12 @@ code_change(_OldVsn, S, _Extra) ->
 %%%===================================================================
 
 send_command_(Command, S) ->
-    CData = exo_json:encode(Command),
+    CData = egear_json:encode(Command),
     Reply = uart:send(S#state.uart, CData),
     {Reply,S}.
 
 send_command_(Command, Data, S) ->
-    CData = exo_json:encode(Command),
+    CData = egear_json:encode(Command),
     case uart:send(S#state.uart, CData) of
 	ok ->
 	    Reply = uart:send(S#state.uart, Data),
@@ -352,6 +356,7 @@ handle_event({struct,[{"in",{array,Input}}]}, S) ->
 handle_event({struct,[{"l", Layout}]}, S) ->
     {L,Is} = decode_layout(Layout,[]),
     {Is1,Added,Deleted} = merge_index(Is, S#state.index_list),
+    ?debug("added items = ~p\n", [Added]),
     S1 = match_layout(L, Added, S),
     ?debug("removed items = ~p\n", [Deleted]),
     lists:foreach(fun(I) -> send_connect_event(S,I,enoent) end, Deleted),
@@ -372,9 +377,9 @@ handle_event({struct,[{"version_core",VsnCore},
     S1 = S#state {  version_core = VsnCore,
 		    version_screen = VsnScreen },
     ?debug("got version core=~p, screen=~p\n", [VsnCore,VsnScreen]),
-    %% when version is received this is a trigger to set applicatin screen 
+    %% when version is received this is a trigger to set application screen 
     Screen = S1#state.screen,
-    if is_integer(Screen), Screen >= 0, Screen >= 15 ->
+    if is_integer(Screen), Screen >= 0, Screen =< 15 ->
 	    Command = {struct,[{screen_display,Screen}]},
 	    {_,Sx} = send_command_(Command,S1),
 	    Sx;
@@ -478,14 +483,14 @@ send_dial_event(S, Index, Unique, Dir, State, Value, V0) ->
 		end,
 	    Path0 = ["egear.dial",Unique,integer_to_list(Index)],
 	    if State =/= State0 ->
-		    xbus:pub(string:join(Path0++[".state"],"."), State, T);
+		    xbus:pub(string:join(Path0++["state"],"."), State, T);
 	       true -> ok
 	    end,
 	    if Value =/= Value0 ->
-		    xbus:pub(string:join(Path0++[".value"],"."), Value, T);
+		    xbus:pub(string:join(Path0++["value"],"."), Value, T);
 	       true -> ok
 	    end,
-	    xbus:pub(string:join(Path0++[".dir"],"."), Dir, T);
+	    xbus:pub(string:join(Path0++["dir"],"."), Dir, T);
        true -> ok
     end,
     if S#state.subs =/= [] ->
@@ -513,6 +518,7 @@ disconnect_event(Reason, S) ->
 %% Reason = ok | string (atom)
 %%
 send_connect_event(S, #index{t=Type, i=Index, u=Unique}, Reason) ->
+    ?debug("send_connect_event: xbus=~p\n", [S#state.xbus]),
     if S#state.xbus ->
 	    Path = ["egear",atom_to_list(Type),Unique,integer_to_list(Index),
 		    "connect"],
